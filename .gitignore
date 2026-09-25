@@ -14,3 +14,14 @@
 /evaluation/datasets/nobel/documents
 /evaluation/results/
 /logs/
+
+/bson_files/
+/wannadb_datsets/
+/info/llm_logs/
+/experiments/llm_feedback_logs/
+/experiments/results/*_llm_calls.parquet
+/experiments/results/hybrid/*/llm_logs/
+/experiments/results/hybrid/*/worker_logs/
+/experiments/results/hybrid/*/claims/
+coordinator.pid
+/wandb/
