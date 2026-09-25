@@ -11,32 +11,30 @@ from typing import Dict, Callable
 logger: logging.Logger = logging.getLogger(__name__)
 
 
-# Singleton class for tracking user interaction with a GUI
-class Tracker(QObject):
-    _instance = None  # Class-level attribute to store the singleton instance
-    time_spent_signal = pyqtSignal(str, float)  # Define the signal with window name and time spent
+class _SingletonMeta(type(QObject)):
 
-    def __new__(cls, *args, **kwargs):
-        """Singleton pattern ensures one instance of the class"""
-        if not cls._instance:
-            cls._instance = super(Tracker, cls).__new__(cls, *args, **kwargs)
-            cls._instance._initialized = False
+    def __call__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super().__call__(*args, **kwargs)
 
         return cls._instance
 
+
+# Singleton class for tracking user interaction with a GUI
+class Tracker(QObject, metaclass=_SingletonMeta):
+    _instance = None  # Class-level attribute to store the singleton instance
+    time_spent_signal = pyqtSignal(str, float)  # Define the signal with window name and time spent
+
     def __init__(self):
-        """Initialize tracking properties if not already initialized"""
-        if not self._initialized:
-            super().__init__()  # Call the QObject initializer
-            self.window_open_times = {}
-            self.timer = QTimer()
-            self.button_click_counts = defaultdict(int)
-            self.tooltips_hovered_counts = defaultdict(int)
-            self.total_window_open_times = {}
-            self._initialized = True
-            self.log = ''
-            self.sequence_number = 1
-            self.json_data = []
+        super().__init__()  # Call the QObject initializer
+        self.window_open_times = {}
+        self.timer = QTimer()
+        self.button_click_counts = defaultdict(int)
+        self.tooltips_hovered_counts = defaultdict(int)
+        self.total_window_open_times = {}
+        self.log = ''
+        self.sequence_number = 1
+        self.json_data = []
 
     def dump_report(self):
         """Dumps the interaction data to two report files.
