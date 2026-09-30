@@ -42,7 +42,7 @@ def main() -> int:
                 for row in r["scores"] if row["attribute"] == attribute]
         return sum(vals) / len(vals) if vals else 0.0
 
-    #Plot 1: grouped bar chart, F1 per attribute per baseline
+    # F1 per attribute
     fig, ax = plt.subplots(figsize=(13, 6))
     x = np.arange(len(attributes))
     width = 0.26
@@ -62,7 +62,7 @@ def main() -> int:
     fig.savefig(out1, dpi=150)
     print(f"Saved {out1}")
 
-    # Plot 2: mean F1 overview + timing
+    # mean F1 and runtime
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
 
     overall = {b: sum(mean_f1(b, a) for a in attributes) / len(attributes) for b in BASELINE_ORDER}
@@ -75,7 +75,7 @@ def main() -> int:
     axes[0].set_ylabel("Mean F1 across all 12 attributes")
     axes[0].tick_params(axis="x", rotation=0, labelsize=8)
 
-
+    # log scale, otherwise the matching time disappears next to the LLM time
     tm, tl = [], []
     for b in BASELINE_ORDER:
         rs = [r for r in records if r["baseline"] == b]
@@ -101,7 +101,6 @@ def main() -> int:
     print(f"Saved {out2}")
 
     return 0
-
 
 
 if __name__ == "__main__":

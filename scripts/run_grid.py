@@ -44,7 +44,6 @@ COUNT_KEYS = [
 
 
 def load_aviation_module():
-
     spec = importlib.util.spec_from_file_location(
         "aviation_dataset", str(ROOT / "wannadb_datsets" / "datasets" / "aviation" / "aviation.py")
     )
@@ -55,7 +54,6 @@ def load_aviation_module():
 
 def score_state(document_base: DocumentBase, ground_truth_docs: List[Dict[str, Any]],
                  attribute_names: List[str]) -> List[Dict[str, Any]]:
-
     rows = []
     for attr in attribute_names:
         r = {k: 0 for k in COUNT_KEYS}
@@ -90,17 +88,14 @@ def checkpoint_path(run_tag: str, baseline_key: str, seed_idx: int) -> Path:
 
 
 def sum_llm_duration(log_path: Optional[str], expected_rounds: Optional[int] = None) -> float:
-
     if not log_path or not Path(log_path).exists():
         return 0.0
     with open(log_path, encoding="utf-8") as f:
         lines = f.readlines()
+    # a killed earlier attempt leaves its lines at the start of the log
     if expected_rounds is not None and len(lines) > expected_rounds:
-        logger.warning(
-            f"{log_path}: {len(lines)} lines but expected {expected_rounds} -- "
-            f"{len(lines) - expected_rounds} leftover lines from an earlier killed attempt at "
-            "this log path, using only the trailing expected_rounds lines for timing."
-        )
+        logger.warning(f"{log_path}: {len(lines)} lines, expected {expected_rounds}, "
+                       f"using only the last {expected_rounds}")
         lines = lines[-expected_rounds:]
     return sum(json.loads(line)["duration_seconds"] for line in lines)
 
@@ -172,6 +167,7 @@ def run_one(
 
 
 class LLMOracleFactory:
+    """ExperimentRunner creates the oracle itself, this keeps a handle on it for the failure counts."""
 
     def __init__(self, log_path: str, seed_value: int, config: Dict[str, Any]):
         self.log_path = log_path
@@ -207,10 +203,7 @@ def main() -> int:
     parser.add_argument("--max-total-tokens", type=int, default=20_000_000,
                         help="safety ceiling per (seed) LLM callback instance, not a real budget")
     parser.add_argument("--timeout-seconds", type=float, default=300.0,
-                        help="per-request client timeout. DeepSeek-V4-Flash's reasoning can need "
-                             "90-110+s for a full-length generation; too short a timeout GUARANTEES "
-                             "failure for hard rounds since a retry at temperature=0 takes the same "
-                             "time again -- do not lower this casually")
+                        help="per request; a long reasoning answer can take more than 100 s")
     parser.add_argument("--skip-baselines", nargs="*", default=[],
                         choices=["A_no_feedback", "B_gold_oracle", "C_llm"])
     args = parser.parse_args()
@@ -232,10 +225,8 @@ def main() -> int:
     logger.info(f"config={json.dumps(config, ensure_ascii=False)}")
 
     if not BSON_PATH.exists():
-        logger.error(f"Missing {BSON_PATH}. Run experiments/llm_feedback_baseline.ipynb's "
-                     "'Dokument-Satz-Embeddings einmalig vorberechnen' cell first (or copy the "
-                     "file from the machine that already has it) -- without it every attribute "
-                     "recomputes ~370s of BERT sentence embeddings from scratch.")
+        logger.error(f"Missing {BSON_PATH}. Create it with the cell 'Dokument-Satz-Embeddings einmalig "
+                     "vorberechnen' in experiments/llm_feedback_baseline.ipynb.")
         return 1
 
     with open(BSON_PATH, "rb") as f:
@@ -264,7 +255,7 @@ def main() -> int:
 
             for seed_idx in range(args.num_seeds):
                 if seed_values is None:
-
+                    # the seeds ExperimentRunner would choose itself
                     probe = ExperimentRunner(DocumentBase.from_bson(bson_bytes), ground_truth,
                                              resource_manager=rm, statistics=Statistics(do_collect=False),
                                              preprocessing_pipeline=Pipeline([]))
@@ -288,8 +279,8 @@ def main() -> int:
 
                 except Exception:
                     failures += 1
-                    logger.error(f"FAILED {baseline_key} seed{seed_idx} -- no checkpoint written, "
-                                "will retry on the next invocation of this script")
+                    logger.error(f"FAILED {baseline_key} seed{seed_idx}, no checkpoint written, "
+                                 "rerun the script to retry")
                     logger.error(traceback.format_exc())
                     continue
 

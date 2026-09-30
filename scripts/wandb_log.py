@@ -23,9 +23,10 @@ ENTITY = "abdelhamid-elhouari-wissenschaftsstadt-darmstadt"
 PROJECT = "wannadb-llm-feedback"
 OVERNIGHT_CHECKPOINTS = ROOT / "experiments" / "results" / "checkpoints"
 OVERNIGHT_LLM_LOGS = ROOT / "experiments" / "llm_feedback_logs"
-
-
 HUMAN_ORACLE = "AutomaticCustomMatchesRandomRankingBasedMatchingFeedback"
+# grids from before the model was stored in config.json all ran on this model
+LEGACY_MODEL = "unsloth/DeepSeek-V4-Flash-0731"
+LEGACY_BASE_URL = "http://10.0.21.72:13505/v1"
 
 
 def rel(path: Path) -> str:
@@ -39,8 +40,9 @@ def api_key_configured() -> bool:
     except wandb.errors.UsageError:
         return False
 
-def matcher_settings() -> Dict[str, Any]:
 
+def matcher_settings() -> Dict[str, Any]:
+    """Read from the source, because building the pipeline would load the embedding models."""
     tree = ast.parse((ROOT / "experiments" / "experiment_runner.py").read_text(encoding="utf-8"))
     for node in ast.walk(tree):
         target = getattr(node, "target", None) or (node.targets[0] if isinstance(node, ast.Assign) else None)
@@ -62,8 +64,7 @@ def llm_settings() -> Dict[str, Any]:
                            if kw.arg == "temperature" and isinstance(kw.value, ast.Constant)})
     params = inspect.signature(llm_feedback.LLMInteractionCallback.__init__).parameters
     defaults = {name: p.default for name, p in params.items() if isinstance(p.default, (bool, int, float, str))}
-    return {"model": llm_feedback.DEFAULT_MODEL, "base_url": llm_feedback.DEFAULT_BASE_URL,
-            "temperature": temperatures[0] if len(temperatures) == 1 else temperatures,
+    return {"temperature": temperatures[0] if len(temperatures) == 1 else temperatures,
             "prompt_format": "a: candidate list; on rejection a second call over all nuggets of the document",
             **defaults}
 
@@ -86,6 +87,8 @@ def llm_summary(rows: pd.DataFrame, failure_counts: Iterable[Optional[Dict[str, 
     if rows.empty:
         return {"llm/rounds": 0, "llm/total_tokens": 0, "llm/hours": 0.0}
     confirmed = rows[rows["message"] == "is-match"]
+    # grids before 2026-09-30 did not check stage 2 confirmations against gold
+    checked = confirmed[confirmed["agrees_with_gold"].notna()]
     return {
         "llm/rounds": len(rows),
         "llm/prompt_tokens": int(rows["prompt_tokens"].sum()),
@@ -93,7 +96,8 @@ def llm_summary(rows: pd.DataFrame, failure_counts: Iterable[Optional[Dict[str, 
         "llm/total_tokens": int(rows["prompt_tokens"].sum() + rows["completion_tokens"].sum()),
         "llm/hours": float(rows["seconds"].sum() / 3600),
         "llm/confirm_rate": float(len(confirmed) / len(rows)),
-        "llm/correct_when_confirmed": float((confirmed["agrees_with_gold"] == True).mean()) if len(confirmed) else None,  # noqa: E712
+        "llm/correct_when_confirmed": float((checked["agrees_with_gold"] == True).mean()) if len(checked) else None,  # noqa: E712
+        "llm/confirmations_not_checked": float(1 - len(checked) / len(confirmed)) if len(confirmed) else None,
         "llm/second_stage_rate": float(rows["stage2"].mean()),
         "llm/empty_response_rate": float(rows["empty_response"].mean()),
         "llm/parse_failures": failures["parse_failures"],
@@ -115,8 +119,6 @@ def table(df: pd.DataFrame):
 
 class Uploader:
     def __init__(self, offline: bool, limit: Optional[int], same_checkout: bool):
-
-        self.wandb = wandb
         self.offline = offline
         self.limit = limit
         self.same_checkout = same_checkout
@@ -139,11 +141,12 @@ class Uploader:
         if self.limit is not None and self.started >= self.limit:
             return None
         self.started += 1
-        settings = self.wandb.Settings(console="off", quiet=True, x_disable_stats=True,
-                                       disable_git=not self.same_checkout, x_disable_meta=not self.same_checkout)
-        return self.wandb.init(entity=ENTITY, project=PROJECT, id=run_id, name=name, group=group,
-                               job_type=job_type, tags=tags, config=config, dir=str(ROOT), settings=settings,
-                               mode="offline" if self.offline else "online")
+        # git state and machine info only describe the run when logging right after it
+        settings = wandb.Settings(console="off", quiet=True, x_disable_stats=True,
+                                  disable_git=not self.same_checkout, x_disable_meta=not self.same_checkout)
+        return wandb.init(entity=ENTITY, project=PROJECT, id=run_id, name=name, group=group,
+                          job_type=job_type, tags=tags, config=config, dir=str(ROOT), settings=settings,
+                          mode="offline" if self.offline else "online")
 
     def limit_reached(self) -> bool:
         return self.limit is not None and self.started >= self.limit
@@ -173,6 +176,7 @@ def log_hybrid_grid(run_tag: str, up: Uploader, figures: Optional[Path] = None) 
         "grid": run_tag, "grid_type": "hybrid", "runner": "scripts/run_hybrid_grid.py",
         "dataset": "aviation", "bson": cfg["bson"], "attributes": attributes, "device": cfg["device"],
         "each_attribute_run_separately": True, "human_oracle": HUMAN_ORACLE,
+        "model": cfg.get("model", LEGACY_MODEL),
         "grid_settings": {k: cfg[k] for k in ("k_values", "variants", "num_seeds", "seed_values", "workers",
                                               "threads_per_worker", "max_attempts", "created_at") if k in cfg},
         "results_dir": rel(run["root"]), "per_round_parquet": rel(per_round_path),
@@ -193,7 +197,9 @@ def log_hybrid_grid(run_tag: str, up: Uploader, figures: Optional[Path] = None) 
         group = f"{run_tag}:no_feedback" if no_feedback else f"{run_tag}:{variant}_h{h:02d}"
         llm_cfg = None
         if not no_feedback and h < budget:
-            llm_cfg = {**llm_defaults, "include_description": cfg["include_description"],
+            llm_cfg = {**llm_defaults, "model": cfg.get("model", LEGACY_MODEL),
+                       "base_url": cfg.get("base_url", LEGACY_BASE_URL), "provider": cfg.get("provider"),
+                       "include_description": cfg["include_description"],
                        "max_response_tokens": cfg["max_response_tokens"], "max_total_tokens": cfg["max_total_tokens"],
                        "timeout_seconds": cfg["timeout_seconds"], "max_retries": cfg["llm_max_retries"],
                        "show_confirmed_examples": variant == "examples"}
@@ -284,13 +290,11 @@ def log_hybrid_summary(run_tag: str, run: Dict[str, Any], per_round: pd.DataFram
                          "examples_better_share": float((diff > 0).mean())})
     if figures is not None:
         for png in sorted(Path(figures).glob("*.png")):
-            logged[f"figures/{png.stem}"] = up.wandb.Image(str(png))
+            logged[f"figures/{png.stem}"] = wandb.Image(str(png))
     wb.log(logged)
     wb.summary.update(headline)
     wb.finish()
     print(f"  logged {run_tag}_summary: {', '.join(f'{k}={v:.3f}' for k, v in headline.items())}")
-
-
 
 
 def log_overnight_grid(run_tag: str, up: Uploader) -> None:
@@ -314,9 +318,9 @@ def log_overnight_grid(run_tag: str, up: Uploader) -> None:
             "variant": baseline, "budget_per_attribute": budget, "seed_idx": seed, "seed_value": rec["seed_value"],
             "human_oracle": HUMAN_ORACLE if baseline == "B_gold_oracle" else None,
             "matcher": {**matcher_settings(), "max_num_feedback": budget, "store_best_guesses": True},
-
+            # the callback code changed after this grid, so only what the grid recorded itself
             "llm": None if baseline != "C_llm" else {
-                "model": llm["model"], "base_url": llm["base_url"], "temperature": llm["temperature"],
+                "model": LEGACY_MODEL, "base_url": LEGACY_BASE_URL, "temperature": llm["temperature"],
                 "prompt_format": llm["prompt_format"], "include_description": cfg["include_description"],
                 "max_response_tokens": cfg["max_response_tokens"], "max_total_tokens": cfg["max_total_tokens"],
                 "timeout_seconds": cfg["timeout_seconds"]},

@@ -22,13 +22,12 @@ def main() -> None:
     doc = candidates[0]
     print(f"Document: {doc.name}  ({len(doc.nuggets)} nuggets)")
 
-
     nuggets_by_span = {(n.start_char, n.end_char): n for n in doc.nuggets}
     picked = [
-        nuggets_by_span[(100, 121)],  # "Sunjet Aviation, Inc." -- overlaps the true air_carrier gold span
-        nuggets_by_span[(126, 133)],  # "Sanford" -- wrong attribute class entirely, an easy distractor
-        nuggets_by_span[(469, 483)],  # "U.S. Air Force" -- plausible-looking wrong organization
-        nuggets_by_span[(495, 513)],  # "Air National Guard" -- another plausible wrong organization
+        nuggets_by_span[(100, 121)],  # "Sunjet Aviation, Inc.", the correct one
+        nuggets_by_span[(126, 133)],  # "Sanford", a city
+        nuggets_by_span[(469, 483)],  # "U.S. Air Force", wrong organization
+        nuggets_by_span[(495, 513)],  # "Air National Guard", wrong organization
     ]
 
     attribute = Attribute(ATTRIBUTE_NAME)

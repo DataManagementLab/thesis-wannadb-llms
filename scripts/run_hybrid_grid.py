@@ -22,11 +22,12 @@ from wannadb.resources import ResourceManager
 from wannadb.statistics import Statistics
 from experiment_runner import ExperimentRunner
 from automatic_feedback import AutomaticCustomMatchesRandomRankingBasedMatchingFeedback
-from llm_feedback import LLMInteractionCallback
+from llm_feedback import DEFAULT_BASE_URL, DEFAULT_MODEL, LLMInteractionCallback
 from hybrid_feedback import HybridInteractionCallback
 from util import consider_overlap_as_match, get_document_by_name
 
-from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
+from openai import (APIConnectionError, APITimeoutError, AuthenticationError, InternalServerError, NotFoundError,
+                    OpenAI, PermissionDeniedError, RateLimitError)
 
 logger = logging.getLogger("hybrid_grid")
 logger.setLevel(logging.INFO)
@@ -34,8 +35,12 @@ logger.setLevel(logging.INFO)
 HYBRID_ROOT = rg.RESULTS_DIR / "hybrid"
 POLL_SECONDS = 60
 
+# an unreachable LLM server does not count as a failed attempt of the unit
 INFRASTRUCTURE_ERRORS = (APIConnectionError, APITimeoutError, InternalServerError, RateLimitError)
 INFRASTRUCTURE_WAIT_SECONDS = 600
+# wrong model or key: every further unit would fail the same way, so the grid stops
+FATAL_LLM_ERRORS = (NotFoundError, AuthenticationError, PermissionDeniedError)
+
 
 class Dirs:
     def __init__(self, run_tag: str):
@@ -60,8 +65,8 @@ class Dirs:
 
 
 def coarse_to_fine(values: List[int]) -> List[int]:
-    """Order k values so that every prefix of the list covers the whole range as evenly as possible:
-    endpoints first, then repeated halving of the step (40 -> 20 -> 10 -> 5 -> 2 -> 1)"""
+    """Endpoints first, then halving the step (40, 20, 10, 5, ...), so a half finished grid
+    already covers the whole range."""
     values = sorted(set(values))
     lo, hi = values[0], values[-1]
     order, seen = [], set()
@@ -83,7 +88,7 @@ def build_jobs(k_values: List[int], max_rounds: int, num_seeds: int, variants: L
     for k in coarse_to_fine(k_values):
         for variant in variants:
             if variant == "examples" and k in (0, max_rounds):
-                continue  # no human value to show (k=0) or no LLM round at all (k=max): same as handoff
+                continue  # identical to handoff there
             for s in range(num_seeds):
                 for a in attributes:
                     jobs.append({"job": f"{variant}_k{k:02d}_seed{s}_{a}", "variant": variant, "k": k,
@@ -98,10 +103,17 @@ def llm_rounds_of(job: Dict[str, Any], cfg: Dict[str, Any]) -> int:
 
 
 def attribute_seed(cfg: Dict[str, Any], seed_idx: int, attribute: str) -> int:
-
+    # otherwise the oracle would pick the same shortlist positions in every attribute
     return cfg["seed_values"][seed_idx] + cfg["attributes"].index(attribute)
 
 
+def llm_connection(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    # the key itself is never stored, only the name of the environment variable holding it
+    api_key = os.environ.get(cfg["api_key_env"]) if cfg.get("api_key_env") else None
+    # OpenRouter would otherwise spread the requests over several providers
+    extra_body = {"provider": {"order": [cfg["provider"]], "allow_fallbacks": False}} if cfg.get("provider") else None
+    return {"base_url": cfg.get("base_url", DEFAULT_BASE_URL), "model": cfg.get("model", DEFAULT_MODEL),
+            "api_key": api_key, "extra_body": extra_body}
 
 
 def prf(counts: Dict[str, int]) -> Dict[str, float]:
@@ -133,7 +145,7 @@ def count_snapshot(guesses, attribute: str, gold_of) -> Dict[str, int]:
 
 
 def best_guess_history(stats: Statistics, attribute: str) -> list:
-
+    # searched instead of hardcoding the index of the matcher in the pipeline
     run_stats = stats["matching"]["runs"]["0"]
     for element in run_stats._entries.values():
         if isinstance(element, Statistics) and attribute in element._entries:
@@ -152,8 +164,7 @@ def run_unit(job: Dict[str, Any], cfg: Dict[str, Any], dirs: Dirs, bson_bytes: b
     needs_llm = variant != "A_no_feedback" and budget > k
 
     llm_log = dirs.llm_logs / f"{job['job']}.jsonl"
-    if llm_log.exists():
-
+    if llm_log.exists():  # left over from a killed attempt
         llm_log.unlink()
 
     holder: Dict[str, Any] = {}
@@ -172,6 +183,7 @@ def run_unit(job: Dict[str, Any], cfg: Dict[str, Any], dirs: Dirs, bson_bytes: b
                 max_retries=cfg["llm_max_retries"],
                 random_seed=seed_value,
                 show_confirmed_examples=(variant == "examples"),
+                **llm_connection(cfg),
             )
         holder["callback"] = HybridInteractionCallback(human, llm, human_rounds=k)
         return holder["callback"]
@@ -314,6 +326,11 @@ def worker_main(args) -> int:
                 run_unit(job, cfg, dirs, bson_bytes, ground_truth, rm, args.worker_id)
                 consecutive_failures = 0
                 units_done += 1
+            except FATAL_LLM_ERRORS as e:
+                logger.error(f"[w{args.worker_id}] LLM request rejected during {job['job']} ({type(e).__name__}: {e}), "
+                             f"stopping the grid")
+                dirs.stop.touch()
+                return 1
             except INFRASTRUCTURE_ERRORS as e:
                 logger.error(f"[w{args.worker_id}] LLM SERVER UNAVAILABLE during {job['job']} ({type(e).__name__}: {e}); "
                              f"unit released without counting an attempt, waiting {INFRASTRUCTURE_WAIT_SECONDS}s")
@@ -333,6 +350,7 @@ def worker_main(args) -> int:
                 time.sleep(wait)
     logger.info(f"[w{args.worker_id}] finished {units_done} units, exiting so the coordinator starts a fresh process")
     return 0
+
 
 def pid_alive(pid: int) -> bool:
     try:
@@ -358,13 +376,13 @@ def progress(dirs: Dirs, cfg: Dict[str, Any], jobs: List[Dict[str, Any]]) -> Dic
 
 
 def release_claims_of_dead_worker(dirs: Dirs, worker_id: int, pid: int, exit_code: int) -> None:
-
     for claim in dirs.claims.glob("*.claim"):
         try:
             info = json.loads(claim.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if info.get("pid") != pid:
+        # by worker id, not pid: on Windows the venv python is a launcher with a different pid
+        if info.get("worker_id") != worker_id:
             continue
         job_id = claim.stem
         claim.unlink(missing_ok=True)
@@ -380,6 +398,27 @@ def claimable_left(dirs: Dirs, cfg: Dict[str, Any], jobs: List[Dict[str, Any]]) 
                and not (dirs.claims / f"{j['job']}.claim").exists() for j in jobs)
 
 
+def check_llm(cfg: Dict[str, Any]) -> Optional[str]:
+    """One small request, so that a wrong model name, key or URL shows up before the grid starts."""
+    conn = llm_connection(cfg)
+    client = OpenAI(base_url=conn["base_url"], api_key=conn["api_key"] or "not-needed", timeout=60, max_retries=1)
+    try:
+        client.chat.completions.create(model=conn["model"], messages=[{"role": "user", "content": "Reply with: ok"}],
+                                       max_tokens=16, temperature=0, extra_body=conn["extra_body"])
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+    return None
+
+
+def tokens_used(dirs: Dirs, cache: Dict[str, int]) -> int:
+    for path in dirs.checkpoints.glob("*.json"):
+        if path.stem not in cache:
+            unit = json.loads(path.read_text(encoding="utf-8"))
+            cache[path.stem] = sum(r["prompt_tokens"] + r["completion_tokens"]
+                                   for rounds in (unit.get("llm_rounds") or {}).values() for r in rounds)
+    return sum(cache.values())
+
+
 def coordinator_main(args) -> int:
     if args.wandb:
         if not wandb_log.api_key_configured():
@@ -387,6 +426,19 @@ def coordinator_main(args) -> int:
             return 1
 
     dirs = Dirs(args.run_tag)
+    stored = json.loads(dirs.config.read_text(encoding="utf-8")) if dirs.config.exists() else None
+    k_values = args.k_values if args.k_values is not None else list(range(0, args.max_rounds + 1))
+    grid = stored or {"k_values": k_values, "max_rounds": args.max_rounds, "model": args.model,
+                      "base_url": args.base_url, "api_key_env": args.api_key_env, "provider": args.provider}
+    if any(k < grid["max_rounds"] for k in grid["k_values"]):
+        if stored is None and args.model is None:
+            logger.error("choose the LLM with --model, it is stored with the grid")
+            return 1
+        problem = check_llm(grid)
+        if problem:
+            logger.error(f"LLM check failed, grid not started: {problem}")
+            return 1
+
     dirs.create()
 
     if dirs.coordinator_pid.exists():
@@ -400,14 +452,13 @@ def coordinator_main(args) -> int:
 
     dataset = rg.load_aviation_module()
     attributes = args.attributes or list(dataset.ATTRIBUTES)
-    k_values = args.k_values if args.k_values is not None else list(range(0, args.max_rounds + 1))
 
     if dirs.config.exists():
         cfg = json.loads(dirs.config.read_text(encoding="utf-8"))
         logger.info(f"resuming {args.run_tag} with its stored config (command line grid options ignored)")
     else:
         with ResourceManager() as rm:
-            # same way run_grid.py obtained its seeds, so seed i here is seed i of the overnight grid
+            # same seeds as run_grid.py
             probe = ExperimentRunner(DocumentBase.from_bson(rg.BSON_PATH.read_bytes()), dataset.load_dataset(),
                                      resource_manager=rm, statistics=Statistics(do_collect=False),
                                      preprocessing_pipeline=Pipeline([]))
@@ -420,6 +471,8 @@ def coordinator_main(args) -> int:
             "include_description": args.include_description, "max_response_tokens": args.max_response_tokens,
             "max_total_tokens": args.max_total_tokens, "timeout_seconds": args.timeout_seconds,
             "llm_max_retries": args.llm_max_retries, "device": args.device,
+            "model": args.model, "base_url": args.base_url, "api_key_env": args.api_key_env,
+            "provider": args.provider, "max_grid_tokens": args.max_grid_tokens,
             "bson": rg.BSON_PATH.name, "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "started_at_epoch": time.time(),
         }
@@ -429,11 +482,11 @@ def coordinator_main(args) -> int:
 
     jobs = json.loads(dirs.jobs.read_text(encoding="utf-8"))
 
-
+    # no worker runs yet, so every claim is left over from a killed run
     for claim in dirs.claims.glob("*.claim"):
         claim.unlink()
 
-    logger.info(f"run_tag={args.run_tag} units={len(jobs)} workers={args.workers} "
+    logger.info(f"run_tag={args.run_tag} units={len(jobs)} workers={args.workers} model={llm_connection(cfg)['model']} "
                 f"seeds={cfg['seed_values']} k_values={len(cfg['k_values'])} variants={cfg['variants']}")
 
     env = dict(os.environ)
@@ -441,7 +494,7 @@ def coordinator_main(args) -> int:
         env[var] = str(cfg["threads_per_worker"])
     env["TOKENIZERS_PARALLELISM"] = "false"
     if cfg["device"] == "cpu":
-
+        # the GPUs are shared with other users and can be full at any time
         env["CUDA_VISIBLE_DEVICES"] = ""
 
     def spawn(worker_id: int) -> subprocess.Popen:
@@ -458,6 +511,7 @@ def coordinator_main(args) -> int:
         time.sleep(2)  # stagger model loading
 
     last_report = 0.0
+    token_cache: Dict[str, int] = {}
     while True:
         for wid, proc in list(workers.items()):
             code = proc.poll()
@@ -480,9 +534,14 @@ def coordinator_main(args) -> int:
         if time.time() - last_report > 600 or not workers:
             p = progress(dirs, cfg, jobs)
             eta = "?" if p["eta_h"] is None else f"{p['eta_h']:.1f}h"
+            used = tokens_used(dirs, token_cache)
             logger.info(f"PROGRESS {p['done']}/{p['total']} units, LLM rounds {p['llm_rounds_done']}/"
-                        f"{p['llm_rounds_total']}, elapsed {p['elapsed_h']:.1f}h, ETA {eta}, "
+                        f"{p['llm_rounds_total']}, tokens {used / 1e6:.1f}M, elapsed {p['elapsed_h']:.1f}h, ETA {eta}, "
                         f"running {len(p['running'])}, failed {len(p['failed'])}, workers alive {len(workers)}")
+            # checked every 10 minutes, units still running when the budget is reached are finished
+            if cfg.get("max_grid_tokens") and used >= cfg["max_grid_tokens"] and not dirs.stop.exists():
+                logger.error(f"token budget of {cfg['max_grid_tokens']} used up, stopping after the running units")
+                dirs.stop.touch()
             last_report = time.time()
 
         if not workers:
@@ -496,7 +555,6 @@ def coordinator_main(args) -> int:
     dirs.coordinator_pid.unlink(missing_ok=True)
 
     if args.wandb:
-        import wandb_log
         try:
             wandb_log.log_hybrid_grid(args.run_tag, wandb_log.Uploader(offline=False, limit=None, same_checkout=True))
         except Exception:
@@ -539,6 +597,14 @@ def main() -> int:
     parser.add_argument("--max-response-tokens", type=int, default=16384)
     parser.add_argument("--max-total-tokens", type=int, default=20_000_000)
     parser.add_argument("--timeout-seconds", type=float, default=300.0)
+    parser.add_argument("--model", default=None, help="required for a new grid with LLM rounds")
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    parser.add_argument("--api-key-env", default=None,
+                        help="name of the environment variable that holds the API key, e.g. OPENROUTER_API_KEY")
+    parser.add_argument("--provider", default=None,
+                        help="OpenRouter only: send every request to this provider, without fallbacks")
+    parser.add_argument("--max-grid-tokens", type=int, default=None,
+                        help="stop the grid once its finished units used this many tokens")
     parser.add_argument("--wandb", action="store_true",
                         help="log the finished grid to Weights & Biases (scripts/wandb_log.py); "
                              "the login is checked before the grid starts")

@@ -19,6 +19,7 @@ import importlib.util
 from wannadb.data.data import DocumentBase
 from util import consider_overlap_as_match, get_document_by_name
 
+
 def load_run(run_tag: str) -> Dict[str, Any]:
     root = HYBRID_ROOT / run_tag
     config = json.loads((root / "config.json").read_text(encoding="utf-8"))
@@ -29,7 +30,7 @@ def load_run(run_tag: str) -> Dict[str, Any]:
 
 
 def complete_combinations(run: Dict[str, Any]) -> set:
-
+    # a mean over a half finished (variant, h) depends on which attributes happen to be done
     need = run["config"]["num_seeds"] * len(run["config"]["attributes"])
     counts = Counter((u["variant"], u["k"]) for u in run["units"])
     return {key for key, n in counts.items() if n >= need}
@@ -44,8 +45,8 @@ def progress_table(run: Dict[str, Any]) -> pd.DataFrame:
 
 
 def per_round_frame(run: Dict[str, Any], complete_only: bool = True) -> pd.DataFrame:
-
     max_rounds = run["config"]["max_rounds"]
+    # round 0 is the table without any feedback
     start = {}
     for u in run["units"]:
         if u["variant"] == "A_no_feedback":
@@ -63,6 +64,7 @@ def per_round_frame(run: Dict[str, Any], complete_only: bool = True) -> pd.DataF
             base = start.get((u["seed_idx"], attr))
             by_round = {0: base} if base is not None else {}
             by_round.update({r["round"]: r for r in history})
+            # if WannaDB ran out of documents early, the last state holds for the remaining rounds
             last = None
             for rnd in range(0, max_rounds + 1):
                 last = by_round.get(rnd, last)
@@ -97,9 +99,8 @@ def unit_frame(run: Dict[str, Any]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# aggregation
 def macro_curve(per_round: pd.DataFrame, variant: str, h: int) -> pd.DataFrame:
-    """Macro F1 per round for one (variant, h): mean over attributes per seed, then mean and std over seeds"""
+    """Mean over the attributes per seed, then mean and std over the seeds."""
     sub = per_round[(per_round.variant == variant) & (per_round.h == h)]
     per_seed = sub.groupby(["seed", "round"])["f1"].mean().reset_index()
     out = per_seed.groupby("round")["f1"].agg(["mean", "std", "count"]).reset_index()
@@ -107,8 +108,9 @@ def macro_curve(per_round: pd.DataFrame, variant: str, h: int) -> pd.DataFrame:
 
 
 def budget_matrix(per_round: pd.DataFrame, variant: str, metric: str = "f1") -> pd.DataFrame:
-
+    """Rows: human rounds h, columns: rounds r. Empty where r < h."""
     sub = per_round[per_round.variant == variant]
+    # examples was not run for h=0 and h=max, where it is identical to handoff
     if variant == "examples":
         max_rounds = int(per_round["round"].max())
         edges = per_round[(per_round.variant == "handoff") & (per_round.h.isin([0, max_rounds]))]
@@ -130,12 +132,13 @@ def human_rounds_needed(matrix: pd.DataFrame, reference: pd.Series, tolerance: f
 
 def equivalent_human_rounds(per_round: pd.DataFrame, variant: str, budget: int,
                             attributes: Optional[List[str]] = None) -> pd.DataFrame:
-    """How much human work does the LLM replace? """
+    """For every h: how many rounds of only human feedback reach the same macro F1 as
+    h human rounds followed by LLM rounds up to the budget"""
     df = per_round if attributes is None else per_round[per_round.attribute.isin(attributes)]
     max_rounds = int(df["round"].max())
     human = df[(df.variant == "handoff") & (df.h == max_rounds)]
     human_curve = human.groupby(["seed", "round"])["f1"].mean().groupby("round").mean()
-
+    # monotone, so that it can be inverted by interpolation
     monotone = np.maximum.accumulate(human_curve.values)
     mat = budget_matrix(df, variant)
     rows = []
@@ -162,9 +165,8 @@ def cumulative_llm_cost(llm_rounds: pd.DataFrame, variant: str, h: int, max_roun
     return cum.groupby(level="round").mean().reset_index()
 
 
-# proposal 3: how high can F1 get with the nuggets that exist?
 def nugget_ceiling(bson_path: Path = BSON_PATH) -> pd.DataFrame:
-
+    """Share of documents whose value overlaps at least one nugget, and the best F1 this allows"""
     spec = importlib.util.spec_from_file_location(
         "aviation_dataset", str(ROOT / "wannadb_datsets" / "datasets" / "aviation" / "aviation.py"))
     aviation = importlib.util.module_from_spec(spec)
@@ -190,6 +192,7 @@ def nugget_ceiling(bson_path: Path = BSON_PATH) -> pd.DataFrame:
                      "F1 ceiling": 2 * coverage / (1 + coverage) if coverage > 0 else 0.0})
     return pd.DataFrame(rows).set_index("attribute")
 
+
 def overnight_final_scores(run_tag: str = "overnight_20260908-0918") -> pd.DataFrame:
     rows = []
     for path in sorted(OVERNIGHT_CHECKPOINTS.glob(f"{run_tag}_*_seed*.json")):
@@ -201,7 +204,6 @@ def overnight_final_scores(run_tag: str = "overnight_20260908-0918") -> pd.DataF
 
 
 def compare_with_overnight(run: Dict[str, Any], h: int, overnight_baseline: str, round_no: int = 25) -> pd.DataFrame:
-
     overnight = overnight_final_scores()
     overnight = overnight[overnight.baseline == overnight_baseline].set_index(["seed", "attribute"])
     rows = []
@@ -221,7 +223,7 @@ def compare_with_overnight(run: Dict[str, Any], h: int, overnight_baseline: str,
 
 
 def compare_prefix(short_tag: str, long_tag: str) -> pd.DataFrame:
-
+    """Round r of a run with a larger budget has to equal the final state of a run with budget r"""
     short, long_ = load_run(short_tag), load_run(long_tag)
     r = short["config"]["max_rounds"]
     long_units = {}

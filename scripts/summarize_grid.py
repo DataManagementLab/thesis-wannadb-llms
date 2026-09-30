@@ -1,4 +1,3 @@
-
 import argparse
 import json
 import sys
@@ -17,13 +16,13 @@ BASELINE_LABEL = {
 
 
 def per_attribute_failure_rates(record):
-
     log_file = record.get("llm_log_file")
     if not log_file or not Path(log_file).exists():
         return {}
     with open(log_file, encoding="utf-8") as f:
         lines = f.readlines()
     expected = len(record["config"]["attributes"]) * record["config"]["max_num_feedback"]
+    # lines from a killed earlier attempt come first
     if len(lines) > expected:
         lines = lines[-expected:]
     counts = {}
@@ -100,7 +99,6 @@ def main() -> int:
 
     llm_records = [r for r in records if r["baseline"] == "C_llm"]
     if llm_records:
-
         agg = {}
         for r in llm_records:
             for attr, (total, bad_n) in per_attribute_failure_rates(r).items():
@@ -109,9 +107,8 @@ def main() -> int:
 
         print("Leere/unbrauchbare LLM-Antworten pro Attribut (ueber alle vorhandenen Seeds):")
         if not agg:
-
-            print(">>> KEINE LLM-Logs gefunden (Pfade: "
-                  f"{sorted({r.get('llm_log_file') for r in llm_records})[:1]} ...) -- Rate nicht berechenbar.")
+            print("Keine LLM-Logs gefunden (z. B. "
+                  f"{sorted({r.get('llm_log_file') for r in llm_records})[:1]}), Rate nicht berechenbar.")
         flagged = False
         for attr in sorted(agg):
             total, bad_n = agg[attr]
@@ -121,9 +118,9 @@ def main() -> int:
                 flagged = True
             print(f"    {attr:30} {bad_n:>3}/{total:<4} ({rate:>5.1%}){marker}")
         if agg and not flagged:
-            print(">>> Alle Attribute unter 5% -- die F1-Zahlen oben sind durchgehend interpretierbar.")
-        else:
-            print(">>> Nur die markierten Attribut/Seed-Kombinationen mit Vorsicht lesen, der Rest ist reguelaer nutzbar.")
+            print("Alle Attribute unter 5%, die F1-Werte oben sind durchgehend interpretierbar.")
+        elif flagged:
+            print("Die markierten Attribute mit Vorsicht lesen, der Rest ist regulaer nutzbar.")
 
     if args.save:
         import pandas as pd

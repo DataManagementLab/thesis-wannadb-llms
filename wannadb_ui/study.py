@@ -11,12 +11,11 @@ from typing import Dict, Callable
 logger: logging.Logger = logging.getLogger(__name__)
 
 
+# overriding __new__ on a QObject overflows the 1 MB main thread stack on Windows
 class _SingletonMeta(type(QObject)):
-
     def __call__(cls, *args, **kwargs):
         if cls._instance is None:
             cls._instance = super().__call__(*args, **kwargs)
-
         return cls._instance
 
 

@@ -33,6 +33,8 @@ class LLMInteractionCallback(BaseInteractionCallback):
             *,
             base_url: str = DEFAULT_BASE_URL,
             model: str = DEFAULT_MODEL,
+            api_key: Optional[str] = None,
+            extra_body: Optional[Dict[str, Any]] = None,
             timeout_seconds: float = 300.0,
             include_description: bool = False,
             attribute_descriptions: Optional[Dict[str, str]] = None,
@@ -47,12 +49,12 @@ class LLMInteractionCallback(BaseInteractionCallback):
             max_retries: int = 5,
             show_confirmed_examples: bool = False,
     ) -> None:
-
         self._documents = documents
         self._user_attribute_name2dataset_attribute_name = user_attribute_name2dataset_attribute_name or {}
 
-        self._client = OpenAI(base_url=base_url, api_key="not-needed", timeout=timeout_seconds)
+        self._client = OpenAI(base_url=base_url, api_key=api_key or "not-needed", timeout=timeout_seconds)
         self._model = model
+        self._extra_body = extra_body
 
         self._include_description = include_description
         self._attribute_descriptions = attribute_descriptions or {}
@@ -62,9 +64,7 @@ class LLMInteractionCallback(BaseInteractionCallback):
         self._max_total_tokens = max_total_tokens
         self._total_tokens_used = 0
 
-        # A truncated or unparsable answer must not quietly become a "no match" -- that would
-        # silently corrupt the experiment. We still return a valid message so the run continues,
-        # but every such case is counted and must be reported alongside the results.
+        # unusable answers still produce a valid message, but are counted so they can be reported
         self._parse_failures = 0
         self._truncated_responses = 0
 
@@ -84,10 +84,9 @@ class LLMInteractionCallback(BaseInteractionCallback):
         self._log_path = log_path
         logger.info(f"LLMInteractionCallback logging interactions to '{self._log_path}'.")
 
-    # BaseInteractionCallback
     def _call(self, pipeline_element_identifier: str, data: Dict[str, Any]) -> Dict[str, Any]:
         if "do-attribute-request" in data.keys():
-            # baseline: never skip an attribute (matches all three automatic_feedback.py oracles)
+            # the gold oracles never skip an attribute either
             return {"do-attribute": True}
 
         return self._give_feedback(data)
@@ -96,12 +95,12 @@ class LLMInteractionCallback(BaseInteractionCallback):
         nuggets: List[InformationNugget] = list(data["nuggets"])
         attribute_name: str = data["attribute"].name
 
-
+        # global random on purpose, so a round uses up as much randomness as a gold oracle round
         rejection_pick: Optional[InformationNugget] = None
         if self._random_rejection_pick:
             rejection_pick = random.choice(nuggets)
 
-        # candidate order is randomised per call, mapping logged (design-space "Candidate order" row)
+        # shuffled against position bias, the order is logged
         order: List[int] = list(range(len(nuggets)))
         self._rng.shuffle(order)
 
@@ -125,8 +124,7 @@ class LLMInteractionCallback(BaseInteractionCallback):
             reject_target: InformationNugget = rejection_pick if rejection_pick is not None else nuggets[0]
 
             if self._search_document_on_reject:
-                # STAGE 2: before giving up on the whole document, look at every nugget already
-                # extracted for it
+                # stage 2: check all nuggets of the document before rejecting it
                 doc_nuggets = list(reject_target.document.nuggets)
                 if len(doc_nuggets) > self._max_document_nuggets:
                     logger.warning(
@@ -160,22 +158,13 @@ class LLMInteractionCallback(BaseInteractionCallback):
                 if doc_ix is not None:
                     found_nugget = doc_nuggets[doc_order[doc_ix]]
                     stage2["resolved_index"] = doc_order[doc_ix]
-
-                    result = {"message": "is-match",
-                              "nugget": found_nugget,
-                              "not-a-match": reject_target
-                    }
+                    stage2["resolved_nugget"] = {"text": found_nugget.text, "start_char": found_nugget.start_char,
+                                                 "end_char": found_nugget.end_char}
+                    result = {"message": "is-match", "nugget": found_nugget, "not-a-match": reject_target}
                 else:
-                    result = {"message": "no-match-in-document",
-                              "nugget": reject_target,
-                              "not-a-match": reject_target
-                    }
+                    result = {"message": "no-match-in-document", "nugget": reject_target, "not-a-match": reject_target}
             else:
-                # old behaviour
-                result = {"message": "no-match-in-document",
-                          "nugget": reject_target,
-                          "not-a-match": reject_target
-                }
+                result = {"message": "no-match-in-document", "nugget": reject_target, "not-a-match": reject_target}
 
         self._log_interaction(
             attribute_name=attribute_name,
@@ -191,11 +180,11 @@ class LLMInteractionCallback(BaseInteractionCallback):
             stage2=stage2,
             num_feedback=data.get("num-feedback"),
             examples_shown=self._examples_shown(attribute_name),
+            confirmed=result["nugget"] if result["message"] == "is-match" else None,
         )
 
         return result
 
-    # prompt construction (format (a): candidate list)
     def add_confirmed_example(self, attribute_name: str, value: str) -> None:
         values = self.confirmed_examples.setdefault(attribute_name, [])
         value = value.strip()
@@ -255,7 +244,6 @@ class LLMInteractionCallback(BaseInteractionCallback):
     def _build_document_prompt(
             self, attribute_name: str, nuggets: List[InformationNugget], order: List[int]
     ) -> str:
-
         attribute_label = f'"{attribute_name}"'
         if self._include_description:
             description = self._attribute_descriptions.get(attribute_name)
@@ -293,20 +281,17 @@ class LLMInteractionCallback(BaseInteractionCallback):
 
     @staticmethod
     def _context_sentence(nugget: InformationNugget) -> str:
-        """The cached context sentence of a nugget, if the signal is present."""
         try:
             return str(nugget[CachedContextSentenceSignal]["text"])
         except Exception:
             return ""
 
-    # DeepSeek call
     def _ask(self, prompt: str):
         if self._max_total_tokens is not None and self._total_tokens_used >= self._max_total_tokens:
             raise TokenBudgetExceeded(
                 f"Token budget of {self._max_total_tokens} already used up "
                 f"({self._total_tokens_used} tokens so far); refusing to send another request."
             )
-
 
         last_error: Optional[BaseException] = None
         for attempt in range(self._max_retries):
@@ -316,9 +301,9 @@ class LLMInteractionCallback(BaseInteractionCallback):
                     messages=[{"role": "user", "content": prompt}],
                     max_tokens=self._max_response_tokens,
                     temperature=0,
+                    extra_body=self._extra_body,
                 )
             except (APIConnectionError, APITimeoutError, InternalServerError, RateLimitError) as e:
-
                 last_error = e
                 wait = min(2 ** attempt, 300)
                 logger.warning(
@@ -331,7 +316,6 @@ class LLMInteractionCallback(BaseInteractionCallback):
         logger.error(f"DeepSeek endpoint unreachable after {self._max_retries} attempts: {last_error}")
         raise last_error
 
-    # response parsing
     def _parse_response(self, response, num_candidates: int) -> Tuple[Optional[int], str, str, Any]:
         usage = response.usage
         if usage is not None:
@@ -380,7 +364,6 @@ class LLMInteractionCallback(BaseInteractionCallback):
 
     @property
     def failure_counts(self) -> Dict[str, int]:
-        """Answers that were unusable"""
         return {
             "parse_failures": self._parse_failures,
             "truncated_responses": self._truncated_responses,
@@ -400,8 +383,6 @@ class LLMInteractionCallback(BaseInteractionCallback):
     def _combine_usage(
             a: Optional[Dict[str, int]], b: Optional[Dict[str, int]]
     ) -> Optional[Dict[str, int]]:
-        """Sum two already-converted usage dicts (see _usage_to_dict). Missing one side is fine,
-        the API is not expected to omit usage, but a round must stay loggable even if it does"""
         if a is None:
             return b
         if b is None:
@@ -410,7 +391,7 @@ class LLMInteractionCallback(BaseInteractionCallback):
 
     @staticmethod
     def _salvage_json(text: str) -> Optional[Dict[str, Any]]:
-        """Best-effort recovery when the model wraps the JSON object in prose or markdown fences"""
+        """For answers that wrap the JSON object in text or a code block."""
         if not text:
             return None
         match = re.search(r"\{.*\}", text, re.DOTALL)
@@ -436,6 +417,7 @@ class LLMInteractionCallback(BaseInteractionCallback):
             stage2: Optional[Dict[str, Any]] = None,
             num_feedback: Optional[int] = None,
             examples_shown: Optional[List[str]] = None,
+            confirmed: Optional[InformationNugget] = None,
     ) -> None:
         record: Dict[str, Any] = {
             "timestamp": time.time(),
@@ -463,12 +445,12 @@ class LLMInteractionCallback(BaseInteractionCallback):
                 "start_char": rejection_pick.start_char,
                 "end_char": rejection_pick.end_char,
             },
-
             "stage2": stage2,
         }
 
-        if self._documents is not None and chosen_ix is not None:
-            record["agrees_with_gold"] = self._check_agreement(attribute_name, nuggets[chosen_ix])
+        # stage 1 or stage 2 confirmation; only logged, never used to decide anything
+        if self._documents is not None and confirmed is not None:
+            record["agrees_with_gold"] = self._check_agreement(attribute_name, confirmed)
 
         with open(self._log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
