@@ -5,6 +5,8 @@ import logging
 import sys
 import time
 import traceback
+import re
+
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -50,6 +52,12 @@ def load_aviation_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def attribute_descriptions() -> Dict[str, str]:
+
+    source = (ROOT / "wannadb_datsets" / "datasets" / "aviation" / "aviation.py").read_text(encoding="utf-8")
+    return dict(re.findall(r'^\s*"(\w+)",?\s*#\s*(.+?)\s*$', source, re.MULTILINE))
 
 
 def score_state(document_base: DocumentBase, ground_truth_docs: List[Dict[str, Any]],

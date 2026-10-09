@@ -25,3 +25,5 @@
 /experiments/results/hybrid/*/claims/
 coordinator.pid
 /wandb/
+
+experiments/results/bench/

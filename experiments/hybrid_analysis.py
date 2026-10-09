@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT / "experiments"))
 import importlib.util
 from wannadb.data.data import DocumentBase
 from util import consider_overlap_as_match, get_document_by_name
+from hybrid_feedback import human_round_numbers
 
 
 def load_run(run_tag: str) -> Dict[str, Any]:
@@ -60,6 +61,8 @@ def per_round_frame(run: Dict[str, Any], complete_only: bool = True) -> pd.DataF
             continue
         if complete_only and (u["variant"], u["k"]) not in complete:
             continue
+
+        human = human_round_numbers(u["variant"], u["k"], max_rounds)
         for attr, history in u["per_round"].items():
             base = start.get((u["seed_idx"], attr))
             by_round = {0: base} if base is not None else {}
@@ -71,7 +74,7 @@ def per_round_frame(run: Dict[str, Any], complete_only: bool = True) -> pd.DataF
                 if last is None:
                     continue
                 rows.append({"variant": u["variant"], "h": u["k"], "seed": u["seed_idx"], "attribute": attr,
-                             "round": rnd, "answerer": ("none" if rnd == 0 else "human" if rnd <= u["k"] else "llm"),
+                             "round": rnd, "answerer": ("none" if rnd == 0 else "human" if rnd in human else "llm"),
                              "precision": last["precision"], "recall": last["recall"], "f1": last["f1_score"]})
     return pd.DataFrame(rows)
 

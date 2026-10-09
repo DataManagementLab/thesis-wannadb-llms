@@ -23,7 +23,8 @@ from wannadb.statistics import Statistics
 from experiment_runner import ExperimentRunner
 from automatic_feedback import AutomaticCustomMatchesRandomRankingBasedMatchingFeedback
 from llm_feedback import DEFAULT_BASE_URL, DEFAULT_MODEL, LLMInteractionCallback
-from hybrid_feedback import HybridInteractionCallback
+from llm_humanlike_feedback import PROMPT_VERSION, HumanLikeLLMCallback
+from hybrid_feedback import SCHEDULES, HybridInteractionCallback, human_round_numbers
 from util import consider_overlap_as_match, get_document_by_name
 
 from openai import (APIConnectionError, APITimeoutError, AuthenticationError, InternalServerError, NotFoundError,
@@ -81,15 +82,15 @@ def coarse_to_fine(values: List[int]) -> List[int]:
     return order
 
 
-def build_jobs(k_values: List[int], max_rounds: int, num_seeds: int, variants: List[str],
+def build_jobs(k_values: List[int], max_rounds: int, seed_indices: List[int], variants: List[str],
                attributes: List[str]) -> List[Dict[str, Any]]:
     jobs = [{"job": f"A_no_feedback_seed{s}_{a}", "variant": "A_no_feedback", "k": 0, "seed_idx": s, "attribute": a}
-            for s in range(num_seeds) for a in attributes]
+            for s in seed_indices for a in attributes]
     for k in coarse_to_fine(k_values):
         for variant in variants:
-            if variant == "examples" and k in (0, max_rounds):
+            if variant != "handoff" and k in (0, max_rounds) and "handoff" in variants:
                 continue  # identical to handoff there
-            for s in range(num_seeds):
+            for s in seed_indices:
                 for a in attributes:
                     jobs.append({"job": f"{variant}_k{k:02d}_seed{s}_{a}", "variant": variant, "k": k,
                                  "seed_idx": s, "attribute": a})
@@ -173,10 +174,19 @@ def run_unit(job: Dict[str, Any], cfg: Dict[str, Any], dirs: Dirs, bson_bytes: b
         human = AutomaticCustomMatchesRandomRankingBasedMatchingFeedback(documents, mapping)
         llm = None
         if needs_llm:
-            llm = LLMInteractionCallback(
+            mode = cfg.get("llm_mode", "list")
+            llm_class = LLMInteractionCallback if mode == "list" else HumanLikeLLMCallback
+            extra = {} if mode == "list" else {"allow_custom_text": mode in ("humanlike-custom", "humanlike-direct"),
+                                               "check_in_full_text": mode == "humanlike-direct",
+                                               "vote_samples": cfg.get("vote_samples", 1),
+                                               "self_check_rounds": cfg.get("self_check_rounds", 0),
+                                               "cautious_review": cfg.get("cautious_review", False),
+                                               "show_accepted_in_prompt": cfg.get("show_accepted_in_prompt", False)}
+            llm = llm_class(
                 documents, mapping,
                 log_path=str(llm_log),
                 include_description=cfg["include_description"],
+                attribute_descriptions=rg.attribute_descriptions() if cfg["include_description"] else None,
                 max_response_tokens=cfg["max_response_tokens"],
                 max_total_tokens=cfg["max_total_tokens"],
                 timeout_seconds=cfg["timeout_seconds"],
@@ -184,8 +194,10 @@ def run_unit(job: Dict[str, Any], cfg: Dict[str, Any], dirs: Dirs, bson_bytes: b
                 random_seed=seed_value,
                 show_confirmed_examples=(variant == "examples"),
                 **llm_connection(cfg),
+                **extra,
             )
-        holder["callback"] = HybridInteractionCallback(human, llm, human_rounds=k)
+        holder["callback"] = HybridInteractionCallback(
+            human, llm, human_rounds=k, human_round_numbers=human_round_numbers(variant, k, cfg["max_rounds"]))
         return holder["callback"]
 
     logger.info(f"[w{worker_id}] START {job['job']} (seed={seed_value}, budget={budget}, "
@@ -245,6 +257,8 @@ def run_unit(job: Dict[str, Any], cfg: Dict[str, Any], dirs: Dirs, bson_bytes: b
                 "agrees_with_gold": rec.get("agrees_with_gold"),
                 "empty_response": rec["raw_response"] == "" or bool(stage2 and stage2["raw_response"] == ""),
                 "num_examples_shown": None if shown is None else len(shown),
+                "oracle_answer": rec.get("oracle_answer"),
+                "decision": rec.get("decision"),
             })
             t_llm += rec["duration_seconds"]
 
@@ -462,22 +476,27 @@ def coordinator_main(args) -> int:
             probe = ExperimentRunner(DocumentBase.from_bson(rg.BSON_PATH.read_bytes()), dataset.load_dataset(),
                                      resource_manager=rm, statistics=Statistics(do_collect=False),
                                      preprocessing_pipeline=Pipeline([]))
-            seed_values = probe.random_seeds[:args.num_seeds]
+            # held-out seeds keep their index, so seed 3 is the same seed in every grid
+            seed_indices = args.seed_indices if args.seed_indices else list(range(args.num_seeds))
+            seed_values = probe.random_seeds[:max(seed_indices) + 1]
         cfg = {
             "run_tag": args.run_tag, "attributes": attributes, "max_rounds": args.max_rounds,
-            "k_values": sorted(set(k_values)), "variants": args.variants, "num_seeds": args.num_seeds,
-            "seed_values": seed_values, "workers": args.workers, "threads_per_worker": args.threads_per_worker,
+            "k_values": sorted(set(k_values)), "variants": args.variants, "num_seeds": len(seed_indices),
+            "seed_indices": seed_indices, "seed_values": seed_values, "workers": args.workers, "threads_per_worker": args.threads_per_worker,
             "units_per_worker": args.units_per_worker, "max_attempts": args.max_attempts,
             "include_description": args.include_description, "max_response_tokens": args.max_response_tokens,
             "max_total_tokens": args.max_total_tokens, "timeout_seconds": args.timeout_seconds,
-            "llm_max_retries": args.llm_max_retries, "device": args.device,
+            "llm_max_retries": args.llm_max_retries, "device": args.device, "llm_mode": args.llm_mode,
+            "prompt_version": "list-v1" if args.llm_mode == "list" else PROMPT_VERSION,
+            "vote_samples": args.vote_samples, "self_check_rounds": args.self_check_rounds,
+            "cautious_review": args.cautious_review, "show_accepted_in_prompt": args.show_accepted_in_prompt,
             "model": args.model, "base_url": args.base_url, "api_key_env": args.api_key_env,
             "provider": args.provider, "max_grid_tokens": args.max_grid_tokens,
             "bson": rg.BSON_PATH.name, "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "started_at_epoch": time.time(),
         }
         dirs.config.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
-        jobs = build_jobs(cfg["k_values"], cfg["max_rounds"], cfg["num_seeds"], cfg["variants"], cfg["attributes"])
+        jobs = build_jobs(cfg["k_values"], cfg["max_rounds"], cfg["seed_indices"], cfg["variants"], cfg["attributes"])
         dirs.jobs.write_text(json.dumps(jobs, indent=1), encoding="utf-8")
 
     jobs = json.loads(dirs.jobs.read_text(encoding="utf-8"))
@@ -580,8 +599,18 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=12)
     parser.add_argument("--max-rounds", type=int, default=40)
     parser.add_argument("--k-values", type=int, nargs="*", default=None, help="default: 0..max-rounds")
-    parser.add_argument("--variants", nargs="+", default=["handoff", "examples"], choices=["handoff", "examples"])
+    parser.add_argument("--variants", nargs="+", default=["handoff", "examples"],
+                        choices=list(SCHEDULES),
+                        help="order of the k human rounds: handoff/examples first, llmfirst last, interleave spread "
+                             "evenly, sandwich half at the start and half at the end")
+    parser.add_argument("--llm-mode", default="list",
+                        choices=["list", "humanlike-nuggets", "humanlike-custom", "humanlike-direct"],
+                        help="list: pick one of the whole shortlist (first version); humanlike: one random document, "
+                             "confirm the guess in its sentence or edit on the tagged full text, custom also lets the "
+                             "LLM copy its own value; direct checks the guess on the tagged full text in one call")
     parser.add_argument("--num-seeds", type=int, default=5)
+    parser.add_argument("--seed-indices", type=int, nargs="*", default=None,
+                        help="run only these seeds (indices into ExperimentRunner.random_seeds), e.g. held-out 3 4")
     parser.add_argument("--attributes", nargs="*", default=None, help="default: all 12 aviation attributes")
     parser.add_argument("--threads-per-worker", type=int, default=2)
     parser.add_argument("--units-per-worker", type=int, default=150,
@@ -594,6 +623,16 @@ def main() -> int:
     parser.add_argument("--device", choices=["cpu", "auto"], default="cpu",
                         help="cpu hides the GPUs from the workers; auto lets torch pick")
     parser.add_argument("--include-description", action="store_true")
+    parser.add_argument("--vote-samples", type=int, default=1,
+                        help="human-like modes: majority over this many sampled answers (temperature 0.7)")
+    parser.add_argument("--self-check-rounds", type=int, default=0,
+                        help="human-like modes: a reviewer call checks the answer against the values accepted so far, "
+                             "up to this many times")
+    parser.add_argument("--cautious-review", action="store_true",
+                        help="the reviewer asks for a revision only when it is sure the answer is wrong")
+    parser.add_argument("--show-accepted-in-prompt", action="store_true",
+                        help="human-like modes: the answering prompt lists the values accepted so far (own answers "
+                             "and human confirmations), as a control for the self-check")
     parser.add_argument("--max-response-tokens", type=int, default=16384)
     parser.add_argument("--max-total-tokens", type=int, default=20_000_000)
     parser.add_argument("--timeout-seconds", type=float, default=300.0)

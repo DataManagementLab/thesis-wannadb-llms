@@ -18,6 +18,8 @@ sys.path.insert(0, str(ROOT / "experiments"))
 import hybrid_analysis as ha
 import llm_feedback
 import wandb
+from hybrid_feedback import human_round_numbers
+
 
 ENTITY = "abdelhamid-elhouari-wissenschaftsstadt-darmstadt"
 PROJECT = "wannadb-llm-feedback"
@@ -27,6 +29,19 @@ HUMAN_ORACLE = "AutomaticCustomMatchesRandomRankingBasedMatchingFeedback"
 # grids from before the model was stored in config.json all ran on this model
 LEGACY_MODEL = "unsloth/DeepSeek-V4-Flash-0731"
 LEGACY_BASE_URL = "http://10.0.21.72:13505/v1"
+PROMPT_FORMATS = {
+    "list": "a: candidate list; on rejection a second call over all nuggets of the document",
+    "humanlike-nuggets": "human-like: one random shortlist document, confirm or edit the guess shown in its "
+                         "sentence; edit on the full document with tagged nuggets, pick a nugget or none",
+    "humanlike-custom": "human-like: one random shortlist document, confirm or edit the guess shown in its "
+                        "sentence; edit on the full document with tagged nuggets, pick a nugget, copy a value "
+                        "from the text (custom match) or none",
+    "humanlike-direct": "human-like in one call: one random shortlist document, the guess is checked on the full "
+                        "document with tagged nuggets; keep it, pick another nugget, copy a value from the text "
+                        "(custom match) or none",
+}
+JOURNAL = ROOT / "info" / "EXPERIMENT_LOG.md"
+BENCH_DIR = ROOT / "experiments" / "results" / "bench"
 
 
 def rel(path: Path) -> str:
@@ -58,13 +73,10 @@ def matcher_settings() -> Dict[str, Any]:
 
 
 def llm_settings() -> Dict[str, Any]:
-    source = inspect.getsource(llm_feedback)
-    temperatures = sorted({kw.value.value for node in ast.walk(ast.parse(source))
-                           for kw in getattr(node, "keywords", [])
-                           if kw.arg == "temperature" and isinstance(kw.value, ast.Constant)})
+    temperature = inspect.signature(llm_feedback.LLMInteractionCallback._ask).parameters["temperature"].default
     params = inspect.signature(llm_feedback.LLMInteractionCallback.__init__).parameters
     defaults = {name: p.default for name, p in params.items() if isinstance(p.default, (bool, int, float, str))}
-    return {"temperature": temperatures[0] if len(temperatures) == 1 else temperatures,
+    return {"temperature": temperature,
             "prompt_format": "a: candidate list; on rejection a second call over all nuggets of the document",
             **defaults}
 
@@ -87,9 +99,15 @@ def llm_summary(rows: pd.DataFrame, failure_counts: Iterable[Optional[Dict[str, 
     if rows.empty:
         return {"llm/rounds": 0, "llm/total_tokens": 0, "llm/hours": 0.0}
     confirmed = rows[rows["message"] == "is-match"]
-    # grids before 2026-09-30 did not check stage 2 confirmations against gold
     checked = confirmed[confirmed["agrees_with_gold"].notna()]
+
+    extra = {}
+    if rows["agrees_with_gold"].notna().all():  # human-like grids check every answer, also "no value"
+        extra = {"llm/agrees_with_gold_all_answers": float((rows["agrees_with_gold"] == True).mean()),  # noqa: E712
+                 "llm/custom_match_rate": float((rows["message"] == "custom-match").mean()),
+                 "llm/no_match_rate": float((rows["message"] == "no-match-in-document").mean())}
     return {
+        **extra,
         "llm/rounds": len(rows),
         "llm/prompt_tokens": int(rows["prompt_tokens"].sum()),
         "llm/completion_tokens": int(rows["completion_tokens"].sum()),
@@ -172,11 +190,14 @@ def log_hybrid_grid(run_tag: str, up: Uploader, figures: Optional[Path] = None) 
 
     matcher = matcher_settings()
     llm_defaults = llm_settings()
+    mode = cfg.get("llm_mode", "list")
+    prompt_version = cfg.get("prompt_version") or ("list-v1" if mode == "list" else "humanlike-v1")
+    model = cfg.get("model") or LEGACY_MODEL
     shared = {
         "grid": run_tag, "grid_type": "hybrid", "runner": "scripts/run_hybrid_grid.py",
         "dataset": "aviation", "bson": cfg["bson"], "attributes": attributes, "device": cfg["device"],
         "each_attribute_run_separately": True, "human_oracle": HUMAN_ORACLE,
-        "model": cfg.get("model", LEGACY_MODEL),
+        "model": model, "llm_mode": mode, "prompt_version": prompt_version,
         "grid_settings": {k: cfg[k] for k in ("k_values", "variants", "num_seeds", "seed_values", "workers",
                                               "threads_per_worker", "max_attempts", "created_at") if k in cfg},
         "results_dir": rel(run["root"]), "per_round_parquet": rel(per_round_path),
@@ -196,20 +217,27 @@ def log_hybrid_grid(run_tag: str, up: Uploader, figures: Optional[Path] = None) 
         name = f"no_feedback_seed{seed}" if no_feedback else f"{variant}_h{h:02d}_seed{seed}"
         group = f"{run_tag}:no_feedback" if no_feedback else f"{run_tag}:{variant}_h{h:02d}"
         llm_cfg = None
+        human = human_round_numbers(variant, h, max_rounds)
         if not no_feedback and h < budget:
-            llm_cfg = {**llm_defaults, "model": cfg.get("model", LEGACY_MODEL),
+            llm_cfg = {**llm_defaults, "prompt_format": PROMPT_FORMATS[mode], "llm_mode": mode,
+                       "prompt_version": prompt_version, "model": model,
+                       "vote_samples": cfg.get("vote_samples", 1), "self_check_rounds": cfg.get("self_check_rounds", 0),
+                       "cautious_review": cfg.get("cautious_review", False),
+                       "show_accepted_in_prompt": cfg.get("show_accepted_in_prompt", False),
                        "base_url": cfg.get("base_url", LEGACY_BASE_URL), "provider": cfg.get("provider"),
                        "include_description": cfg["include_description"],
                        "max_response_tokens": cfg["max_response_tokens"], "max_total_tokens": cfg["max_total_tokens"],
                        "timeout_seconds": cfg["timeout_seconds"], "max_retries": cfg["llm_max_retries"],
                        "show_confirmed_examples": variant == "examples"}
         config = {**shared, "variant": variant, "human_rounds": 0 if no_feedback else h,
+                  "human_round_numbers": sorted(human) if not no_feedback else [],
                   "llm_rounds_per_attribute": max(budget - h, 0), "budget_per_attribute": budget,
                   "seed_idx": seed, "seed_value": cfg["seed_values"][seed],
                   "attribute_seeds": {u["attribute"]: u["seed_value"] for u in group_units},
                   "matcher": {**matcher, "max_num_feedback": budget, "store_best_guesses": True},
                   "llm": llm_cfg}
-        wb = up.start(f"{run_tag}-{name}", name, group, variant, [run_tag, "hybrid-grid", variant], config)
+        tags = [run_tag, "hybrid-grid", variant] + ([] if no_feedback else [mode, prompt_version, model.split("/")[-1]])
+        wb = up.start(f"{run_tag}-{name}", name, group, variant, tags, config)
         if wb is None:
             continue
 
@@ -230,9 +258,10 @@ def log_hybrid_grid(run_tag: str, up: Uploader, figures: Optional[Path] = None) 
                 by_round = by_round.reindex(f1.index, fill_value=0).cumsum()
                 tokens_cum, seconds_cum = by_round["tokens"], by_round["seconds"]
             for r in f1.index:
+                human_so_far = sum(1 for x in human if x <= r)
                 wb.log({"macro_f1": float(f1.loc[r].mean()), "macro_precision": float(prec[r]),
-                        "macro_recall": float(recall[r]), "human_rounds_so_far": min(r, h),
-                        "llm_rounds_so_far": max(r - h, 0), "llm_tokens_cumulative": float(tokens_cum[r]),
+                        "macro_recall": float(recall[r]), "human_rounds_so_far": human_so_far,
+                        "llm_rounds_so_far": r - human_so_far, "llm_tokens_cumulative": float(tokens_cum[r]),
                         "llm_hours_cumulative": float(seconds_cum[r] / 3600),
                         **{f"f1/{a}": float(f1.loc[r, a]) for a in f1.columns}}, step=int(r))
         wb.summary.update({
@@ -257,6 +286,9 @@ def log_hybrid_summary(run_tag: str, run: Dict[str, Any], per_round: pd.DataFram
                        shared: Dict[str, Any], figures: Optional[Path]) -> None:
     max_rounds = run["config"]["max_rounds"]
     complete = ha.complete_combinations(run)
+    if not complete - {("A_no_feedback", 0)}:
+        print(f"  no setting of {run_tag} is complete for all seeds, no summary run")
+        return
     per_round = per_round[[(v, h) in complete for v, h in zip(per_round.variant, per_round.h)]]
     wb = up.start(f"{run_tag}-summary", f"{run_tag}_summary", f"{run_tag}:summary", "analysis",
                   [run_tag, "hybrid-grid", "summary"], {**shared, "complete_settings": len(complete)})
@@ -339,9 +371,63 @@ def log_overnight_grid(run_tag: str, up: Uploader) -> None:
         print(f"  logged {name}")
 
 
+def log_journal(up: Uploader) -> None:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    wb = up.start(f"journal-{stamp}", f"experiment_journal_{stamp}", "journal", "notes", ["journal"],
+                  {"file": rel(JOURNAL)})
+    if wb is None:
+        return
+    wb.notes = JOURNAL.read_text(encoding="utf-8")
+    artifact = wandb.Artifact("experiment-journal", type="notes",
+                              description="info/EXPERIMENT_LOG.md: what was run, why, and what came out")
+    artifact.add_file(str(JOURNAL))
+    wb.log_artifact(artifact)
+    wb.finish()
+    print(f"  logged journal ({rel(JOURNAL)})")
+
+
+def log_bench(path: Path, model: str, up: Uploader) -> None:
+
+    recs = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    model = recs[0].get("bench_model", model) if recs else model
+    rows = pd.DataFrame([{
+        "mode": r["bench_mode"], "prompt_version": r.get("prompt_version", "humanlike-v1"),
+        "attribute": r["attribute"], "oracle_answer": r["oracle_answer"], "decision": r["decision"],
+        "message": r["result_message"], "agrees_with_gold": r["agrees_with_gold"],
+        "tokens": (r.get("usage") or {}).get("total_tokens", 0), "seconds": r["duration_seconds"],
+        "edit_step": r["step_b"] is not None} for r in recs])
+
+    for (mode, version), sub in rows.groupby(["mode", "prompt_version"]):
+        name = f"bench_{path.stem}_{mode}"
+        wb = up.start(f"bench-{path.stem}-{mode}", name, "prompt-bench", "bench",
+                      ["prompt-bench", mode, version, model.split("/")[-1]],
+                      {"bench_file": rel(path), "llm_mode": mode, "prompt_version": version, "model": model,
+                       "cases": len(sub), "runner": "scripts/bench_feedback_prompts.py"})
+
+        if wb is None:
+            continue
+        agree = sub["agrees_with_gold"] == True  # noqa: E712
+        summary = {"bench/agrees_with_gold": float(agree.mean()), "bench/cases": len(sub),
+                   "bench/tokens_per_decision": float(sub["tokens"].mean()),
+                   "bench/seconds_per_decision": float(sub["seconds"].mean()),
+                   "bench/edit_step_rate": float(sub["edit_step"].mean())}
+        summary.update({f"bench/agrees_when_human_says/{case}": float(agree[sub.oracle_answer == case].mean())
+                        for case in sorted(sub.oracle_answer.dropna().unique())})
+        summary.update({f"bench/agrees_by_attribute/{a}": float(agree[sub.attribute == a].mean())
+                        for a in sorted(sub.attribute.unique())})
+        wb.log({"bench_decisions": table(sub.reset_index(drop=True))})
+        wb.summary.update(summary)
+        wb.finish()
+        print(f"  logged {name}: {summary['bench/agrees_with_gold']:.3f}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--hybrid", nargs="*", default=[], help="run tags of run_hybrid_grid.py grids")
+    parser.add_argument("--journal", action="store_true", help="upload info/EXPERIMENT_LOG.md as a new version")
+    parser.add_argument("--bench", nargs="*", type=Path, default=[], help="jsonl files of bench_feedback_prompts.py")
+    parser.add_argument("--bench-model", default="zai-org/GLM-5.3-Flash",
+                        help="model of bench files that do not store it")
     parser.add_argument("--overnight", nargs="*", default=[], help="run tags of run_grid.py grids")
     parser.add_argument("--figures", type=Path, default=None, help="folder of PNGs to attach to the hybrid summary run")
     parser.add_argument("--offline", action="store_true", help="write W&B files locally only, upload nothing")
@@ -357,6 +443,10 @@ def main() -> int:
         log_overnight_grid(tag, up)
     for tag in args.hybrid:
         log_hybrid_grid(tag, up, args.figures)
+    for path in args.bench:
+        log_bench(path, args.bench_model, up)
+    if args.journal:
+        log_journal(up)
     print(f"done: {up.started} W&B runs logged, {len(up.skipped)} already existed"
           + ("" if args.offline else f", see https://wandb.ai/{ENTITY}/{PROJECT}"))
     return 0

@@ -286,7 +286,7 @@ class LLMInteractionCallback(BaseInteractionCallback):
         except Exception:
             return ""
 
-    def _ask(self, prompt: str):
+    def _ask(self, prompt: str, temperature: float=0):
         if self._max_total_tokens is not None and self._total_tokens_used >= self._max_total_tokens:
             raise TokenBudgetExceeded(
                 f"Token budget of {self._max_total_tokens} already used up "
@@ -300,7 +300,7 @@ class LLMInteractionCallback(BaseInteractionCallback):
                     model=self._model,
                     messages=[{"role": "user", "content": prompt}],
                     max_tokens=self._max_response_tokens,
-                    temperature=0,
+                    temperature=temperature,
                     extra_body=self._extra_body,
                 )
             except (APIConnectionError, APITimeoutError, InternalServerError, RateLimitError) as e:
