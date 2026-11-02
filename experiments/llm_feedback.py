@@ -302,6 +302,7 @@ class LLMInteractionCallback(BaseInteractionCallback):
                     max_tokens=self._max_response_tokens,
                     temperature=temperature,
                     extra_body=self._extra_body,
+                    **({"logprobs": True} if getattr(self, "_request_logprobs", False) else {}),
                 )
             except (APIConnectionError, APITimeoutError, InternalServerError, RateLimitError) as e:
                 last_error = e

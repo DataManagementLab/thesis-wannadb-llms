@@ -218,6 +218,9 @@ def log_hybrid_grid(run_tag: str, up: Uploader, figures: Optional[Path] = None) 
         group = f"{run_tag}:no_feedback" if no_feedback else f"{run_tag}:{variant}_h{h:02d}"
         llm_cfg = None
         human = human_round_numbers(variant, h, max_rounds)
+        if variant == "random" or variant.startswith("esc_"):
+            human = {u["attribute"]: sorted(r for r, answerer, *_ in u.get("answers", {}).get(u["attribute"], [])
+                                            if answerer.startswith("human")) for u in group_units}
         if not no_feedback and h < budget:
             llm_cfg = {**llm_defaults, "prompt_format": PROMPT_FORMATS[mode], "llm_mode": mode,
                        "prompt_version": prompt_version, "model": model,
@@ -230,7 +233,7 @@ def log_hybrid_grid(run_tag: str, up: Uploader, figures: Optional[Path] = None) 
                        "timeout_seconds": cfg["timeout_seconds"], "max_retries": cfg["llm_max_retries"],
                        "show_confirmed_examples": variant == "examples"}
         config = {**shared, "variant": variant, "human_rounds": 0 if no_feedback else h,
-                  "human_round_numbers": sorted(human) if not no_feedback else [],
+                  "human_round_numbers": (human if isinstance(human, dict) else sorted(human)) if not no_feedback else [],
                   "llm_rounds_per_attribute": max(budget - h, 0), "budget_per_attribute": budget,
                   "seed_idx": seed, "seed_value": cfg["seed_values"][seed],
                   "attribute_seeds": {u["attribute"]: u["seed_value"] for u in group_units},
@@ -258,7 +261,10 @@ def log_hybrid_grid(run_tag: str, up: Uploader, figures: Optional[Path] = None) 
                 by_round = by_round.reindex(f1.index, fill_value=0).cumsum()
                 tokens_cum, seconds_cum = by_round["tokens"], by_round["seconds"]
             for r in f1.index:
-                human_so_far = sum(1 for x in human if x <= r)
+                if isinstance(human, dict):  # mean over the attributes
+                    human_so_far = sum(sum(1 for x in rounds if x <= r) for rounds in human.values()) / len(human)
+                else:
+                    human_so_far = sum(1 for x in human if x <= r)
                 wb.log({"macro_f1": float(f1.loc[r].mean()), "macro_precision": float(prec[r]),
                         "macro_recall": float(recall[r]), "human_rounds_so_far": human_so_far,
                         "llm_rounds_so_far": r - human_so_far, "llm_tokens_cumulative": float(tokens_cum[r]),

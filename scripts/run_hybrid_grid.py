@@ -1,7 +1,10 @@
 import argparse
+import importlib.util
 import json
 import logging
 import os
+import random
+import re
 import socket
 import subprocess
 import sys
@@ -24,7 +27,7 @@ from experiment_runner import ExperimentRunner
 from automatic_feedback import AutomaticCustomMatchesRandomRankingBasedMatchingFeedback
 from llm_feedback import DEFAULT_BASE_URL, DEFAULT_MODEL, LLMInteractionCallback
 from llm_humanlike_feedback import PROMPT_VERSION, HumanLikeLLMCallback
-from hybrid_feedback import SCHEDULES, HybridInteractionCallback, human_round_numbers
+from hybrid_feedback import ESCALATIONS, SCHEDULES, HybridInteractionCallback, human_round_numbers
 from util import consider_overlap_as_match, get_document_by_name
 
 from openai import (APIConnectionError, APITimeoutError, AuthenticationError, InternalServerError, NotFoundError,
@@ -34,6 +37,7 @@ logger = logging.getLogger("hybrid_grid")
 logger.setLevel(logging.INFO)
 
 HYBRID_ROOT = rg.RESULTS_DIR / "hybrid"
+DATASETS_DIR = rg.ROOT / "wannadb_datsets" / "datasets"
 POLL_SECONDS = 60
 
 # an unreachable LLM server does not count as a failed attempt of the unit
@@ -65,6 +69,37 @@ class Dirs:
         return self.checkpoints / f"{job_id}.json"
 
 
+def dataset_module(name: str):
+    spec = importlib.util.spec_from_file_location(f"{name}_dataset", str(DATASETS_DIR / name / f"{name}.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def dataset_bson(name: str) -> Path:
+    if name == "aviation":
+        return rg.BSON_PATH
+    fixed = rg.ROOT / "bson_files" / f"{name}-preprocessed-fixed.bson"
+    return fixed if fixed.exists() else rg.ROOT / "bson_files" / f"{name}-preprocessed.bson"
+
+
+def dataset_descriptions(name: str) -> Dict[str, str]:
+    source = (DATASETS_DIR / name / f"{name}.py").read_text(encoding="utf-8")
+    return dict(re.findall(r'^\s*"(\w+)",?\s*#\s*(.+?)\s*$', source, re.MULTILINE))
+
+
+def document_base_bytes(cfg: Dict[str, Any]) -> bytes:
+    raw = dataset_bson(cfg.get("dataset", "aviation")).read_bytes()
+    if not cfg.get("num_docs"):
+        return raw
+    db = DocumentBase.from_bson(raw)
+    names = sorted(d.name for d in db.documents)
+    # the same shuffle for every size, so a smaller collection is part of every larger one
+    random.Random(cfg.get("subset_seed", 0)).shuffle(names)
+    keep = set(names[:cfg["num_docs"]])
+    return DocumentBase([d for d in db.documents if d.name in keep], db.attributes).to_bson()
+
+
 def coarse_to_fine(values: List[int]) -> List[int]:
     """Endpoints first, then halving the step (40, 20, 10, 5, ...), so a half finished grid
     already covers the whole range."""
@@ -88,7 +123,7 @@ def build_jobs(k_values: List[int], max_rounds: int, seed_indices: List[int], va
             for s in seed_indices for a in attributes]
     for k in coarse_to_fine(k_values):
         for variant in variants:
-            if variant != "handoff" and k in (0, max_rounds) and "handoff" in variants:
+            if variant in SCHEDULES and variant != "handoff" and k in (0, max_rounds) and "handoff" in variants:
                 continue  # identical to handoff there
             for s in seed_indices:
                 for a in attributes:
@@ -170,6 +205,9 @@ def run_unit(job: Dict[str, Any], cfg: Dict[str, Any], dirs: Dirs, bson_bytes: b
 
     holder: Dict[str, Any] = {}
 
+    dataset = cfg.get("dataset", "aviation")
+    escalation = variant if variant in ESCALATIONS else None
+
     def oracle_factory(documents, mapping):
         human = AutomaticCustomMatchesRandomRankingBasedMatchingFeedback(documents, mapping)
         llm = None
@@ -181,12 +219,15 @@ def run_unit(job: Dict[str, Any], cfg: Dict[str, Any], dirs: Dirs, bson_bytes: b
                                                "vote_samples": cfg.get("vote_samples", 1),
                                                "self_check_rounds": cfg.get("self_check_rounds", 0),
                                                "cautious_review": cfg.get("cautious_review", False),
-                                               "show_accepted_in_prompt": cfg.get("show_accepted_in_prompt", False)}
+                                               "show_accepted_in_prompt": cfg.get("show_accepted_in_prompt", False),
+                                               "probe_samples": cfg.get("probe_samples", 2) if variant == "esc_vote" else 0,
+                                               "review_as_signal": variant == "esc_review",
+                                               "request_logprobs": cfg.get("request_logprobs", False)}
             llm = llm_class(
                 documents, mapping,
                 log_path=str(llm_log),
                 include_description=cfg["include_description"],
-                attribute_descriptions=rg.attribute_descriptions() if cfg["include_description"] else None,
+                attribute_descriptions=dataset_descriptions(dataset) if cfg["include_description"] else None,
                 max_response_tokens=cfg["max_response_tokens"],
                 max_total_tokens=cfg["max_total_tokens"],
                 timeout_seconds=cfg["timeout_seconds"],
@@ -197,7 +238,9 @@ def run_unit(job: Dict[str, Any], cfg: Dict[str, Any], dirs: Dirs, bson_bytes: b
                 **extra,
             )
         holder["callback"] = HybridInteractionCallback(
-            human, llm, human_rounds=k, human_round_numbers=human_round_numbers(variant, k, cfg["max_rounds"]))
+            human, llm, human_rounds=k,
+            human_round_numbers=human_round_numbers(variant, k, cfg["max_rounds"], seed=seed_value),
+            escalation=escalation)
         return holder["callback"]
 
     logger.info(f"[w{worker_id}] START {job['job']} (seed={seed_value}, budget={budget}, "
@@ -229,12 +272,23 @@ def run_unit(job: Dict[str, Any], cfg: Dict[str, Any], dirs: Dirs, bson_bytes: b
 
     per_round: Dict[str, List[Dict[str, Any]]] = {}
     snapshot_matches_final: Dict[str, bool] = {}
+    # the cells themselves, so that other match rules (exact, any overlap) can be scored later
+    docs_order = [d.name for d in runner.document_base.documents]
+    guess_spans: Dict[str, Dict[str, Any]] = {}
     for attr in attributes:
         rows = []
-        if budget > 0:
-            for round_no, guesses in best_guess_history(stats, attr):
-                counts = count_snapshot(guesses, attr, gold_of)
-                rows.append({"round": round_no, **counts, **prf(counts)})
+        span_rounds = []
+        history = best_guess_history(stats, attr) if budget > 0 else []
+        for i, (round_no, guesses) in enumerate(history):
+            counts = count_snapshot(guesses, attr, gold_of)
+            rows.append({"round": round_no, **counts, **prf(counts)})
+            if round_no % cfg.get("spans_every", 1) == 0 or i == len(history) - 1:
+                by_doc = {doc_name: (None if g is None else [g[2], g[3]]) for doc_name, g in guesses}
+                span_rounds.append([round_no, [by_doc.get(name) for name in docs_order]])
+        final = [None if not d.attribute_mappings.get(attr) else
+                 [d.attribute_mappings[attr][0].start_char, d.attribute_mappings[attr][0].end_char]
+                 for d in runner.document_base.documents]
+        guess_spans[attr] = {"docs": docs_order, "rounds": span_rounds, "final": final}
         per_round[attr] = rows
         if rows:
             snapshot_matches_final[attr] = all(rows[-1][key] == final_by_attr[attr][key] for key in rg.COUNT_KEYS)
@@ -259,12 +313,14 @@ def run_unit(job: Dict[str, Any], cfg: Dict[str, Any], dirs: Dirs, bson_bytes: b
                 "num_examples_shown": None if shown is None else len(shown),
                 "oracle_answer": rec.get("oracle_answer"),
                 "decision": rec.get("decision"),
+                "llm_calls": rec.get("llm_calls"),
+                "signals": rec.get("signals"),
             })
             t_llm += rec["duration_seconds"]
 
     answers: Dict[str, List[List[Any]]] = defaultdict(list)
-    for attr, round_no, answerer, message in holder["callback"].answers:
-        answers[attr].append([round_no, answerer, message])
+    for attr, round_no, answerer, message, document in holder["callback"].answers:
+        answers[attr].append([round_no, answerer, message, document])
 
     record = {
         "job": job["job"], "variant": variant, "k": k, "seed_idx": seed_idx, "attribute": job["attribute"],
@@ -278,6 +334,7 @@ def run_unit(job: Dict[str, Any], cfg: Dict[str, Any], dirs: Dirs, bson_bytes: b
         "snapshot_matches_final": snapshot_matches_final,
         "llm_rounds": dict(llm_rounds),
         "answers": dict(answers),
+        "guess_spans": guess_spans,
         "llm_failure_counts": holder["callback"].failure_counts,
     }
 
@@ -321,8 +378,8 @@ def worker_main(args) -> int:
     import torch
     torch.set_num_threads(cfg["threads_per_worker"])
 
-    bson_bytes = rg.BSON_PATH.read_bytes()
-    ground_truth = rg.load_aviation_module().load_dataset()
+    bson_bytes = document_base_bytes(cfg)
+    ground_truth = dataset_module(cfg.get("dataset", "aviation")).load_dataset()
 
     units_done = 0
     consecutive_failures = 0
@@ -464,7 +521,7 @@ def coordinator_main(args) -> int:
     dirs.stop.unlink(missing_ok=True)
     dirs.done_marker.unlink(missing_ok=True)
 
-    dataset = rg.load_aviation_module()
+    dataset = dataset_module(args.dataset)
     attributes = args.attributes or list(dataset.ATTRIBUTES)
 
     if dirs.config.exists():
@@ -472,8 +529,8 @@ def coordinator_main(args) -> int:
         logger.info(f"resuming {args.run_tag} with its stored config (command line grid options ignored)")
     else:
         with ResourceManager() as rm:
-            # same seeds as run_grid.py
-            probe = ExperimentRunner(DocumentBase.from_bson(rg.BSON_PATH.read_bytes()), dataset.load_dataset(),
+            # same seeds as run_grid.py; they do not depend on the dataset
+            probe = ExperimentRunner(DocumentBase.from_bson(rg.BSON_PATH.read_bytes()), rg.load_aviation_module().load_dataset(),
                                      resource_manager=rm, statistics=Statistics(do_collect=False),
                                      preprocessing_pipeline=Pipeline([]))
             # held-out seeds keep their index, so seed 3 is the same seed in every grid
@@ -492,7 +549,10 @@ def coordinator_main(args) -> int:
             "cautious_review": args.cautious_review, "show_accepted_in_prompt": args.show_accepted_in_prompt,
             "model": args.model, "base_url": args.base_url, "api_key_env": args.api_key_env,
             "provider": args.provider, "max_grid_tokens": args.max_grid_tokens,
-            "bson": rg.BSON_PATH.name, "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "dataset": args.dataset, "num_docs": args.num_docs, "subset_seed": args.subset_seed,
+            "spans_every": args.spans_every, "probe_samples": args.probe_samples,
+            "request_logprobs": args.request_logprobs,
+            "bson": dataset_bson(args.dataset).name, "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "started_at_epoch": time.time(),
         }
         dirs.config.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -600,9 +660,23 @@ def main() -> int:
     parser.add_argument("--max-rounds", type=int, default=40)
     parser.add_argument("--k-values", type=int, nargs="*", default=None, help="default: 0..max-rounds")
     parser.add_argument("--variants", nargs="+", default=["handoff", "examples"],
-                        choices=list(SCHEDULES),
+                        choices=list(SCHEDULES) + list(ESCALATIONS),
                         help="order of the k human rounds: handoff/examples first, llmfirst last, interleave spread "
-                             "evenly, sandwich half at the start and half at the end")
+                             "evenly, sandwich half at the start and half at the end, random at random rounds; "
+                             "esc_*: the human answers the first k rounds and every LLM round the signal marks as "
+                             "unsure (vote: sampled answers disagree, review: a reviewer says revise, oracle: the "
+                             "answer is wrong by gold, an upper bound)")
+    parser.add_argument("--dataset", default="aviation",
+                        help="a folder in wannadb_datsets/datasets with a preprocessed bson in bson_files")
+    parser.add_argument("--num-docs", type=int, default=None,
+                        help="use a random subset of this many documents (nested across sizes), for scaling")
+    parser.add_argument("--subset-seed", type=int, default=0)
+    parser.add_argument("--spans-every", type=int, default=1,
+                        help="store the cells of every n-th round (all rounds for 1), for other match rules later")
+    parser.add_argument("--probe-samples", type=int, default=2,
+                        help="esc_vote: sampled extra answers (temperature 0.7) that must agree with the answer")
+    parser.add_argument("--request-logprobs", action="store_true",
+                        help="ask the server for token log probabilities and log the weakest one of the answer")
     parser.add_argument("--llm-mode", default="list",
                         choices=["list", "humanlike-nuggets", "humanlike-custom", "humanlike-direct"],
                         help="list: pick one of the whole shortlist (first version); humanlike: one random document, "

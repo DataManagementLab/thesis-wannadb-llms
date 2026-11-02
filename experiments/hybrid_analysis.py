@@ -62,8 +62,10 @@ def per_round_frame(run: Dict[str, Any], complete_only: bool = True) -> pd.DataF
         if complete_only and (u["variant"], u["k"]) not in complete:
             continue
 
-        human = human_round_numbers(u["variant"], u["k"], max_rounds)
+        human = human_round_numbers(u["variant"], u["k"], max_rounds, seed=u["seed_value"])
         for attr, history in u["per_round"].items():
+            if u.get("answers", {}).get(attr) and len(u["answers"][attr][0]) > 3:  # escalations decide per round
+                human = {r for r, answerer, *_ in u["answers"][attr] if answerer.startswith("human")}
             base = start.get((u["seed_idx"], attr))
             by_round = {0: base} if base is not None else {}
             by_round.update({r["round"]: r for r in history})

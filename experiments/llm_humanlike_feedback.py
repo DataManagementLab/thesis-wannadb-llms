@@ -21,7 +21,8 @@ class HumanLikeLLMCallback(LLMInteractionCallback):
 
     def __init__(self, *args, allow_custom_text: bool = False, check_in_full_text: bool = False,
                  vote_samples: int = 1, vote_temperature: float = 0.7, self_check_rounds: int = 0,
-                 cautious_review: bool = False, show_accepted_in_prompt: bool = False, **kwargs) -> None:
+                 cautious_review: bool = False, show_accepted_in_prompt: bool = False, probe_samples: int = 0,
+                 review_as_signal: bool = False, request_logprobs: bool = False, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._allow_custom_text = allow_custom_text
         # one call on the tagged full text instead of first asking about the sentence alone
@@ -35,8 +36,16 @@ class HumanLikeLLMCallback(LLMInteractionCallback):
         self._cautious_review = cautious_review
         # control for the self-check: the answering call itself sees the values accepted so far
         self._show_accepted_in_prompt = show_accepted_in_prompt
+        # uncertainty signals for a hand-off to the human, they never change the answer itself:
+        # extra sampled answers that may disagree, and a reviewer verdict
+        self._probe_samples = probe_samples
+        self._review_as_signal = review_as_signal
+        self._request_logprobs = request_logprobs
         self._accepted_values: Dict[str, List[str]] = {}
+        self._last_accepted: Optional[Tuple[str, str]] = None
         self._custom_not_found = 0
+        # the logged record of the latest round, read by the hybrid callback
+        self.last_round: Optional[Dict[str, Any]] = None
 
     @property
     def mode(self) -> str:
@@ -99,6 +108,17 @@ class HumanLikeLLMCallback(LLMInteractionCallback):
         else:
             span, step = self._answer_once(prompt, document, nugget_of)
 
+        if self._probe_samples > 0:
+            probes = [self._answer_once(prompt, document, nugget_of, self._vote_temperature)
+                      for _ in range(self._probe_samples)]
+            step["probes"] = [p[0] for p in probes]
+            step["probe_disagrees"] = any(not self._same_answer(span, p[0]) for p in probes)
+            step.setdefault("extra_calls", []).extend(p[1] for p in probes)
+        if self._review_as_signal:
+            verdict, problem, review_step = self._review(attribute_name, tagged_text, tag_of, document, span)
+            step["signal_review"] = {"verdict": verdict, "problem": problem}
+            step.setdefault("extra_calls", []).append(review_step)
+
         checks: List[Dict[str, Any]] = []
         for _ in range(self._self_check_rounds):
             verdict, problem, check_step = self._review(attribute_name, tagged_text, tag_of, document, span)
@@ -154,15 +174,18 @@ class HumanLikeLLMCallback(LLMInteractionCallback):
         return None, step
 
     @staticmethod
+    def _same_answer(a: Optional[List[int]], b: Optional[List[int]]) -> bool:
+        if a is None or b is None:
+            return a is None and b is None
+        return consider_overlap_as_match(a[0], a[1], b[0], b[1])
+
+    @staticmethod
     def _majority(answers: List[Tuple[Optional[List[int]], Dict[str, Any]]]
                   ) -> Tuple[Optional[List[int]], Dict[str, Any]]:
-        """Answers whose spans overlap like a correct cell count as the same answer"""
         groups: List[List[int]] = []
         for i, (span, _) in enumerate(answers):
             for group in groups:
-                other = answers[group[0]][0]
-                if (span is None and other is None) or (span is not None and other is not None and
-                                                        consider_overlap_as_match(other[0], other[1], span[0], span[1])):
+                if HumanLikeLLMCallback._same_answer(answers[group[0]][0], span):
                     group.append(i)
                     break
             else:
@@ -250,6 +273,7 @@ class HumanLikeLLMCallback(LLMInteractionCallback):
         self._accepted_values[attribute_name] = [v for v in values if v.strip()]
 
     def _remember_accepted(self, attribute_name: str, result: Dict[str, Any]) -> None:
+        self._last_accepted = None
         if result["message"] == "is-match":
             value = result["nugget"].text
         elif result["message"] == "custom-match":
@@ -257,6 +281,14 @@ class HumanLikeLLMCallback(LLMInteractionCallback):
         else:
             return
         self._accepted_values.setdefault(attribute_name, []).append(value.strip())
+        self._last_accepted = (attribute_name, value.strip())
+
+    def withdraw_last_answer(self, attribute_name: str) -> None:
+        if self._last_accepted is not None and self._last_accepted[0] == attribute_name:
+            values = self._accepted_values.get(attribute_name, [])
+            if values and values[-1] == self._last_accepted[1]:
+                values.pop()
+        self._last_accepted = None
 
     def _build_confirm_prompt(self, attribute_name: str, pick: InformationNugget) -> str:
         lines = [
@@ -429,7 +461,34 @@ class HumanLikeLLMCallback(LLMInteractionCallback):
             "usage": self._usage_to_dict(usage),
             "seconds": seconds,
         }
+        if self._request_logprobs:
+            step["answer_logprob"] = self._answer_logprob(choice, content)
         return parsed, step
+
+    @staticmethod
+    def _answer_logprob(choice: Any, content: str) -> Optional[float]:
+
+        tokens = getattr(getattr(choice, "logprobs", None), "content", None)
+        joined = "".join(t.token for t in tokens) if tokens else ""
+        # some servers also return the tokens of the hidden reasoning, which come before the answer
+        offset = joined.rfind(content) if content else -1
+        if not tokens or offset < 0:
+            return None
+        regions = []
+        for key in ("span", "text"):
+            match = re.search(rf'"{key}"\s*:\s*("(?:[^"\\]|\\.)*"|null)', content)
+            if match:
+                regions.append(match.span(1))
+                if match.group(1) != "null":
+                    break
+        if not regions:
+            return None
+        values, position = [], -offset
+        for t in tokens:
+            start, position = position, position + len(t.token)
+            if any(start < r_end and position > r_start for r_start, r_end in regions):
+                values.append(t.logprob)
+        return min(values) if values else None
 
     @staticmethod
     def _span_dict(nugget: InformationNugget) -> Dict[str, Any]:
@@ -522,5 +581,12 @@ class HumanLikeLLMCallback(LLMInteractionCallback):
             "parse_failures_so_far": self._parse_failures,
             "truncated_so_far": self._truncated_responses,
         }
+        main_step = record["step_b"] or record["step_a"]
+        out["signals"] = {
+            "probe_disagrees": main_step.get("probe_disagrees"),
+            "review_verdict": (main_step.get("signal_review") or {}).get("verdict"),
+            "answer_logprob": main_step.get("answer_logprob"),
+        }
+        self.last_round = out
         with open(self._log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(out, ensure_ascii=False) + "\n")
