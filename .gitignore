@@ -27,3 +27,4 @@ coordinator.pid
 /wandb/
 
 experiments/results/bench/
+experiments/results/llm_only/
