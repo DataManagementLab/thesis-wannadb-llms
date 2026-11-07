@@ -77,11 +77,17 @@ class HybridInteractionCallback(BaseInteractionCallback):
 
     @staticmethod
     def _document_of(result: Dict[str, Any]) -> Optional[str]:
+        if result["message"] == "multi-match":
+            return ",".join(n.document.name for n in result["nuggets"])
         source = result.get("document") or getattr(result.get("nugget"), "document", None)
         return getattr(source, "name", None)
 
     def _remember_confirmed_value(self, attribute_name: str, result: Dict[str, Any]) -> None:
         if self._llm is None or not hasattr(self._llm, "add_confirmed_example"):
+            return
+        if result["message"] == "multi-match":
+            for nugget in result["nuggets"]:
+                self._llm.add_confirmed_example(attribute_name, nugget.text)
             return
         if result["message"] == "is-match":
             value = result["nugget"].text
@@ -94,3 +100,7 @@ class HybridInteractionCallback(BaseInteractionCallback):
     @property
     def failure_counts(self) -> Optional[Dict[str, int]]:
         return getattr(self._llm, "failure_counts", None)
+
+    @property
+    def pick_log(self) -> Optional[List[Dict[str, Any]]]:
+        return getattr(self._llm, "pick_log", None)

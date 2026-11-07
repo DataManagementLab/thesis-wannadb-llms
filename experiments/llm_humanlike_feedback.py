@@ -508,6 +508,9 @@ class HumanLikeLLMCallback(LLMInteractionCallback):
             return None
         return gold_document["mentions"].get(dataset_attribute_name, [])
 
+    def _extra_log_fields(self) -> Dict[str, Any]:
+        return {}
+
     def _log(self, attribute_name: str, data: Dict[str, Any], record: Dict[str, Any], result: Dict[str, Any],
              duration: float) -> None:
         if result["message"] == "custom-match":
@@ -587,6 +590,7 @@ class HumanLikeLLMCallback(LLMInteractionCallback):
             "review_verdict": (main_step.get("signal_review") or {}).get("verdict"),
             "answer_logprob": main_step.get("answer_logprob"),
         }
+        out.update(self._extra_log_fields())
         self.last_round = out
         with open(self._log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(out, ensure_ascii=False) + "\n")

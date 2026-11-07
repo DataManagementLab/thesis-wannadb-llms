@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import importlib.util
 import json
 import logging
@@ -28,6 +29,9 @@ from automatic_feedback import AutomaticCustomMatchesRandomRankingBasedMatchingF
 from llm_feedback import DEFAULT_BASE_URL, DEFAULT_MODEL, LLMInteractionCallback
 from llm_humanlike_feedback import PROMPT_VERSION, HumanLikeLLMCallback
 from hybrid_feedback import ESCALATIONS, SCHEDULES, HybridInteractionCallback, human_round_numbers
+from multi_feedback import MULTI_PROMPT_VERSIONS, GoldMultiFeedback, MultiFeedbackLLMCallback
+from stored_feedback import (READ_ORDERS, RULE_VARIANTS, StoredAnswerFeedback, gold_answers, load_llm_answers,
+                             read_documents, stored_setting)
 from util import consider_overlap_as_match, get_document_by_name
 
 from openai import (APIConnectionError, APITimeoutError, AuthenticationError, InternalServerError, NotFoundError,
@@ -209,11 +213,24 @@ def run_unit(job: Dict[str, Any], cfg: Dict[str, Any], dirs: Dirs, bson_bytes: b
     escalation = variant if variant in ESCALATIONS else None
 
     def oracle_factory(documents, mapping):
-        human = AutomaticCustomMatchesRandomRankingBasedMatchingFeedback(documents, mapping)
+        multi = cfg.get("multi_feedback", False)
+        human = (GoldMultiFeedback if multi else AutomaticCustomMatchesRandomRankingBasedMatchingFeedback)(
+            documents, mapping)
         llm = None
-        if needs_llm:
+        stored = stored_setting(variant)
+        if stored is not None:
+            rule, count = stored
+            answers = (gold_answers(ground_truth) if cfg["stored_answers"] == "gold"
+                       else load_llm_answers(cfg["stored_answers"], seed_idx, ground_truth))
+            # one read set per seed, shared by all columns: a read document answers every column
+            read = None if count is None else read_documents(ground_truth, count, cfg["seed_values"][seed_idx],
+                                                              cfg.get("read_order", "random"))
+            llm = StoredAnswerFeedback(answers, pick_rule=rule, read_documents=read)
+        elif needs_llm:
             mode = cfg.get("llm_mode", "list")
             llm_class = LLMInteractionCallback if mode == "list" else HumanLikeLLMCallback
+            if multi:
+                llm_class = MultiFeedbackLLMCallback
             extra = {} if mode == "list" else {"allow_custom_text": mode in ("humanlike-custom", "humanlike-direct"),
                                                "check_in_full_text": mode == "humanlike-direct",
                                                "vote_samples": cfg.get("vote_samples", 1),
@@ -223,6 +240,8 @@ def run_unit(job: Dict[str, Any], cfg: Dict[str, Any], dirs: Dirs, bson_bytes: b
                                                "probe_samples": cfg.get("probe_samples", 2) if variant == "esc_vote" else 0,
                                                "review_as_signal": variant == "esc_review",
                                                "request_logprobs": cfg.get("request_logprobs", False)}
+            if multi:
+                extra["multi_context"] = cfg.get("multi_context", "sentence")
             llm = llm_class(
                 documents, mapping,
                 log_path=str(llm_log),
@@ -251,7 +270,8 @@ def run_unit(job: Dict[str, Any], cfg: Dict[str, Any], dirs: Dirs, bson_bytes: b
         DocumentBase.from_bson(bson_bytes), ground_truth,
         user_attribute_name2attribute_name={a: a for a in attributes},
         preprocessing_pipeline=Pipeline([]),
-        matching_pipeline_settings={"max_num_feedback": budget, "store_best_guesses": True},
+        matching_pipeline_settings={"max_num_feedback": budget, "store_best_guesses": True,
+                                    "len_ranked_list": cfg.get("len_ranked_list", 10)},
         resource_manager=rm, statistics=stats,
     )
     runner.random_seeds = [seed_value]
@@ -315,6 +335,7 @@ def run_unit(job: Dict[str, Any], cfg: Dict[str, Any], dirs: Dirs, bson_bytes: b
                 "decision": rec.get("decision"),
                 "llm_calls": rec.get("llm_calls"),
                 "signals": rec.get("signals"),
+                "multi": rec.get("multi"),
             })
             t_llm += rec["duration_seconds"]
 
@@ -335,6 +356,7 @@ def run_unit(job: Dict[str, Any], cfg: Dict[str, Any], dirs: Dirs, bson_bytes: b
         "llm_rounds": dict(llm_rounds),
         "answers": dict(answers),
         "guess_spans": guess_spans,
+        "pick_log": holder["callback"].pick_log,
         "llm_failure_counts": holder["callback"].failure_counts,
     }
 
@@ -500,8 +522,9 @@ def coordinator_main(args) -> int:
     stored = json.loads(dirs.config.read_text(encoding="utf-8")) if dirs.config.exists() else None
     k_values = args.k_values if args.k_values is not None else list(range(0, args.max_rounds + 1))
     grid = stored or {"k_values": k_values, "max_rounds": args.max_rounds, "model": args.model,
-                      "base_url": args.base_url, "api_key_env": args.api_key_env, "provider": args.provider}
-    if any(k < grid["max_rounds"] for k in grid["k_values"]):
+                      "base_url": args.base_url, "api_key_env": args.api_key_env, "provider": args.provider,
+                      "stored_answers": args.stored_answers}
+    if any(k < grid["max_rounds"] for k in grid["k_values"]) and not grid.get("stored_answers"):
         if stored is None and args.model is None:
             logger.error("choose the LLM with --model, it is stored with the grid")
             return 1
@@ -536,15 +559,25 @@ def coordinator_main(args) -> int:
             # held-out seeds keep their index, so seed 3 is the same seed in every grid
             seed_indices = args.seed_indices if args.seed_indices else list(range(args.num_seeds))
             seed_values = probe.random_seeds[:max(seed_indices) + 1]
+        if args.multi_feedback and any(k < args.max_rounds for k in k_values) and args.llm_mode != "humanlike-direct":
+            raise SystemExit("--multi-feedback with LLM rounds needs --llm-mode humanlike-direct")
+        variants = args.variants + [f"reads_{count}" for count in args.read_documents]
+        if any(stored_setting(v) for v in variants) != bool(args.stored_answers):
+            raise SystemExit("--stored-answers belongs to the rule_* variants and --read-documents, and they need it")
         cfg = {
             "run_tag": args.run_tag, "attributes": attributes, "max_rounds": args.max_rounds,
-            "k_values": sorted(set(k_values)), "variants": args.variants, "num_seeds": len(seed_indices),
+            "k_values": sorted(set(k_values)), "variants": variants, "num_seeds": len(seed_indices),
             "seed_indices": seed_indices, "seed_values": seed_values, "workers": args.workers, "threads_per_worker": args.threads_per_worker,
             "units_per_worker": args.units_per_worker, "max_attempts": args.max_attempts,
             "include_description": args.include_description, "max_response_tokens": args.max_response_tokens,
             "max_total_tokens": args.max_total_tokens, "timeout_seconds": args.timeout_seconds,
             "llm_max_retries": args.llm_max_retries, "device": args.device, "llm_mode": args.llm_mode,
             "prompt_version": "list-v1" if args.llm_mode == "list" else PROMPT_VERSION,
+            "multi_feedback": args.multi_feedback,
+            "multi_context": args.multi_context if args.multi_feedback else None,
+            "multi_prompt_version": MULTI_PROMPT_VERSIONS[args.multi_context] if args.multi_feedback else None,
+            # which matcher ran, e.g. before or after the multi-match change
+            "matching_py_md5": hashlib.md5((rg.ROOT / "wannadb" / "matching" / "matching.py").read_bytes()).hexdigest(),
             "vote_samples": args.vote_samples, "self_check_rounds": args.self_check_rounds,
             "cautious_review": args.cautious_review, "show_accepted_in_prompt": args.show_accepted_in_prompt,
             "model": args.model, "base_url": args.base_url, "api_key_env": args.api_key_env,
@@ -552,6 +585,8 @@ def coordinator_main(args) -> int:
             "dataset": args.dataset, "num_docs": args.num_docs, "subset_seed": args.subset_seed,
             "spans_every": args.spans_every, "probe_samples": args.probe_samples,
             "request_logprobs": args.request_logprobs,
+            "stored_answers": args.stored_answers, "len_ranked_list": args.len_ranked_list,
+            "read_order": args.read_order,
             "bson": dataset_bson(args.dataset).name, "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "started_at_epoch": time.time(),
         }
@@ -659,13 +694,25 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=12)
     parser.add_argument("--max-rounds", type=int, default=40)
     parser.add_argument("--k-values", type=int, nargs="*", default=None, help="default: 0..max-rounds")
-    parser.add_argument("--variants", nargs="+", default=["handoff", "examples"],
-                        choices=list(SCHEDULES) + list(ESCALATIONS),
+    parser.add_argument("--variants", nargs="*", default=["handoff", "examples"],
+                        choices=list(SCHEDULES) + list(ESCALATIONS) + list(RULE_VARIANTS),
                         help="order of the k human rounds: handoff/examples first, llmfirst last, interleave spread "
                              "evenly, sandwich half at the start and half at the end, random at random rounds; "
                              "esc_*: the human answers the first k rounds and every LLM round the signal marks as "
                              "unsure (vote: sampled answers disagree, review: a reviewer says revise, oracle: the "
-                             "answer is wrong by gold, an upper bound)")
+                             "answer is wrong by gold, an upper bound); rule_*: the human answers the first k rounds, "
+                             "then a fixed rule picks the row and --stored-answers answers it, no LLM is asked")
+    parser.add_argument("--stored-answers", default=None,
+                        help="for the rule_* variants and --read-documents: answers.jsonl of llm_only_baseline.py "
+                             "(repeat = seed index), or gold")
+    parser.add_argument("--read-documents", type=int, nargs="*", default=[],
+                        help="adds a variant reads_N per value: only N documents are answered (the same N in every "
+                             "column of a seed), WannaDB fills the rest; needs a long enough --len-ranked-list")
+    parser.add_argument("--read-order", choices=READ_ORDERS, default="random",
+                        help="how --read-documents chooses the documents, always from the texts alone")
+    parser.add_argument("--len-ranked-list", type=int, default=10,
+                        help="rows WannaDB shows per round, half on each side of the threshold; more rows than twice "
+                             "the documents shows all of them, and a confirmed row moves the threshold further")
     parser.add_argument("--dataset", default="aviation",
                         help="a folder in wannadb_datsets/datasets with a preprocessed bson in bson_files")
     parser.add_argument("--num-docs", type=int, default=None,
@@ -682,6 +729,12 @@ def main() -> int:
                         help="list: pick one of the whole shortlist (first version); humanlike: one random document, "
                              "confirm the guess in its sentence or edit on the tagged full text, custom also lets the "
                              "LLM copy its own value; direct checks the guess on the tagged full text in one call")
+    parser.add_argument("--multi-feedback", action="store_true",
+                        help="human and LLM confirm every right row of the ranked list at once (multi-match, needs "
+                             "the multi-match matcher); with no right row they answer one row as before. LLM only "
+                             "with --llm-mode humanlike-direct")
+    parser.add_argument("--multi-context", choices=["sentence", "paragraph"], default="sentence",
+                        help="what each row of the LLM's list question shows around the guess")
     parser.add_argument("--num-seeds", type=int, default=5)
     parser.add_argument("--seed-indices", type=int, nargs="*", default=None,
                         help="run only these seeds (indices into ExperimentRunner.random_seeds), e.g. held-out 3 4")
