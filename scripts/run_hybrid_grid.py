@@ -225,7 +225,8 @@ def run_unit(job: Dict[str, Any], cfg: Dict[str, Any], dirs: Dirs, bson_bytes: b
             # one read set per seed, shared by all columns: a read document answers every column
             read = None if count is None else read_documents(ground_truth, count, cfg["seed_values"][seed_idx],
                                                               cfg.get("read_order", "random"))
-            llm = StoredAnswerFeedback(answers, pick_rule=rule, read_documents=read)
+            llm = StoredAnswerFeedback(answers, pick_rule=rule, read_documents=read,
+                                       multi_min=cfg.get("multi_min", 3))
         elif needs_llm:
             mode = cfg.get("llm_mode", "list")
             llm_class = LLMInteractionCallback if mode == "list" else HumanLikeLLMCallback
@@ -586,7 +587,7 @@ def coordinator_main(args) -> int:
             "spans_every": args.spans_every, "probe_samples": args.probe_samples,
             "request_logprobs": args.request_logprobs,
             "stored_answers": args.stored_answers, "len_ranked_list": args.len_ranked_list,
-            "read_order": args.read_order,
+            "read_order": args.read_order, "multi_min": args.multi_min,
             "bson": dataset_bson(args.dataset).name, "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "started_at_epoch": time.time(),
         }
@@ -708,6 +709,8 @@ def main() -> int:
     parser.add_argument("--read-documents", type=int, nargs="*", default=[],
                         help="adds a variant reads_N per value: only N documents are answered (the same N in every "
                              "column of a seed), WannaDB fills the rest; needs a long enough --len-ranked-list")
+    parser.add_argument("--multi-min", type=int, default=3,
+                        help="rule_multi*: fewest right rows for confirming them at once, else one row is answered")
     parser.add_argument("--read-order", choices=READ_ORDERS, default="random",
                         help="how --read-documents chooses the documents, always from the texts alone")
     parser.add_argument("--len-ranked-list", type=int, default=10,

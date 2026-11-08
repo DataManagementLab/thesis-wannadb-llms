@@ -12,11 +12,12 @@ from wannadb.data.data import InformationNugget
 from wannadb.data.signals import CachedDistanceSignal
 from wannadb.interaction import BaseInteractionCallback
 
-# which row of the ranked list gets the next answer; the list is sorted by falling distance
-PICK_RULES = ("random", "nearest", "surest", "least_sure", "rotate", "disagree")
+
+PICK_RULES = ("random", "nearest", "surest", "least_sure", "rotate", "disagree", "multi", "multi_rotate")
 ROTATION = ("surest", "nearest", "least_sure")
+MULTI_ROTATION = ("multi_surest", "nearest", "least_sure")
+MULTI_ROWS = 10
 RULE_VARIANTS = tuple(f"rule_{rule}" for rule in PICK_RULES)
-# which documents the LLM reads, chosen from the texts alone: at random, the middle of N clusters, or far from each other
 READ_ORDERS = ("random", "typical", "diverse")
 
 Spans = List[List[int]]
@@ -93,12 +94,14 @@ class StoredAnswerFeedback(BaseInteractionCallback):
     answered, and the column ends when none of them is left."""
 
     def __init__(self, answers: Dict[str, Dict[str, Spans]], pick_rule: str = "random",
-                 read_documents: Optional[Set[str]] = None) -> None:
+                 read_documents: Optional[Set[str]] = None, multi_min: int = 3) -> None:
         if pick_rule not in PICK_RULES:
             raise ValueError(f"unknown pick rule {pick_rule!r}")
         self._answers = answers
         self._pick_rule = pick_rule
         self._read_documents = read_documents
+        # fewest right rows for a multi-match
+        self._multi_min = multi_min
         self.pick_log: List[Dict[str, Any]] = []
 
     def _call(self, pipeline_element_identifier: str, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -112,9 +115,21 @@ class StoredAnswerFeedback(BaseInteractionCallback):
             if not rows:
                 return {"message": "stop-interactive-matching"}
 
-        pick = self._pick(rows, data)
-        result = self._answer(attribute_name, pick)
+        rule = self._round_rule(data["num-feedback"])
         threshold: float = data["max-distance"]
+        if rule in ("multi", "multi_surest"):
+            checked = rows if rule == "multi" else rows[-MULTI_ROWS:]
+            right = [n for n in checked if self._fits(n, self._spans(attribute_name, n))]
+            if len(right) >= self._multi_min:
+                self.pick_log.append({"attribute": attribute_name, "round": data["num-feedback"],
+                                      "rows": len(data["nuggets"]), "rows_checked": len(checked),
+                                      "rows_confirmed": len(right), "threshold": float(threshold),
+                                      "message": "multi-match"})
+                return {"message": "multi-match", "nuggets": right}
+            rule = "random" if rule == "multi" else "nearest"
+
+        pick = self._pick(rule, rows, data)
+        result = self._answer(attribute_name, pick)
         self.pick_log.append({
             "attribute": attribute_name, "round": data["num-feedback"], "document": pick.document.name,
             "position": next(i for i, n in enumerate(data["nuggets"]) if n is pick), "rows": len(data["nuggets"]),
@@ -125,11 +140,15 @@ class StoredAnswerFeedback(BaseInteractionCallback):
         })
         return result
 
-    def _pick(self, rows: List[InformationNugget], data: Dict[str, Any]) -> InformationNugget:
+    def _round_rule(self, round_no: int) -> str:
+        if self._pick_rule == "rotate":
+            return ROTATION[(round_no - 1) % len(ROTATION)]
+        if self._pick_rule == "multi_rotate":
+            return MULTI_ROTATION[(round_no - 1) % len(MULTI_ROTATION)]
+        return self._pick_rule
+
+    def _pick(self, rule: str, rows: List[InformationNugget], data: Dict[str, Any]) -> InformationNugget:
         threshold: float = data["max-distance"]
-        rule = self._pick_rule
-        if rule == "rotate":
-            rule = ROTATION[(data["num-feedback"] - 1) % len(ROTATION)]
         if rule == "surest":
             return rows[-1]
         if rule == "least_sure":
