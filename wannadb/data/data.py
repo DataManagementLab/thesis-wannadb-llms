@@ -1,4 +1,5 @@
 import functools
+import itertools
 import logging
 import time
 from typing import Any, Dict, List, Optional, Type, Union, Tuple
@@ -662,7 +663,17 @@ class DocumentBase:
             serializable_base["documents"].append(serializable_document)
 
         logger.info("Convert to BSON bytes.")
-        bson_bytes: bytes = bson.encode(serializable_base)
+
+        # THESIS CHANGE: BSON docs hold at most 2 GB, so a large dataset could be a problem
+        try:
+            bson_bytes: bytes = bson.encode(serializable_base)
+        except Exception as error:
+            logger.info(f"The document base does not fit into one BSON document ({error}). "
+                        f"Write one BSON document per document instead.")
+            encoded_parts: List[bytes] = [bson.encode({"attributes": serializable_base["attributes"], "documents": []})]
+            for serializable_document in serializable_base["documents"]:
+                encoded_parts.append(bson.encode({"documents": [serializable_document]}))
+            bson_bytes = b"".join(encoded_parts)
 
         tack: float = time.time()
         logger.info(f"Serialized document base in {tack - tick} seconds.")
@@ -682,7 +693,15 @@ class DocumentBase:
         tick: float = time.time()
 
         logger.info("Convert from BSON bytes.")
-        serialized_base: Dict[str, Any] = bson.decode(bson_bytes)
+
+        # THESIS CHANGE: adjust this method as well
+        serialized_parts = bson.decode_iter(bson_bytes)
+        serialized_base: Dict[str, Any] = next(serialized_parts)
+        serialized_documents = itertools.chain(
+            serialized_base["documents"],
+            (serialized_document for serialized_part in serialized_parts
+                                        for serialized_document in serialized_part["documents"])
+        )
 
         # deserialize the document base
         document_base: "DocumentBase" = cls([], [])
@@ -700,12 +719,16 @@ class DocumentBase:
             document_base.attributes.append(attribute)
 
         logger.info("Deserialize documents.")
-        for serialized_document in serialized_base["documents"]:
+        for serialized_document in serialized_documents:
             # deserialize the document
             document: Document = Document(name=serialized_document["name"], text=serialized_document["text"])
 
             old_to_new_index: Dict[int, int] = dict()
             old_index = 0
+            # THESIS CHANGE: each new nugget was compared with ALL nuggets kept so
+            # far, so loading grew with the square of the nuggets per document. Only a nugget at the same position can be a duplicate
+            # (InformationNugget.duplicates), so only those are compared now.
+            kept_at_position: Dict[Tuple[int, int], List[int]] = dict()  # position -> indices in document.nuggets
             for serialized_nugget in serialized_document["nuggets"]:
                 # deserialize the nugget
                 nugget: InformationNugget = InformationNugget(
@@ -719,12 +742,14 @@ class DocumentBase:
                     signal: BaseSignal = BaseSignal.from_serializable(serialized_signal, signal_identifier)
                     nugget.signals[signal_identifier] = signal
 
-                possible_duplicate, idx = get_possible_duplicate(nugget, document.nuggets)
+                same_position: List[int] = kept_at_position.setdefault((nugget.start_char, nugget.end_char), [])
+                possible_duplicate, idx = get_possible_duplicate(nugget, [document.nuggets[i] for i in same_position])
                 if possible_duplicate is None:
                     old_to_new_index[old_index] = len(document.nuggets)
+                    same_position.append(len(document.nuggets))
                     document.nuggets.append(nugget)
                 else:
-                    old_to_new_index[old_index] = idx
+                    old_to_new_index[old_index] = same_position[idx]
 
                 old_index += 1
 

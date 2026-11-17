@@ -48,8 +48,12 @@ class PCAReducer(DimensionReducer):
             statistics: Statistics
     ) -> None:
         # Assume that all embeddings have same number of features
+        # THESIS CHANGE (2026-11-13, see CORE_CHANGES.md): document_base.nuggets builds a new list of all nuggets on
+        # every access. loop before asked for it only once per nugget, so the step grew with the square of the number
+        # of nuggets (1 to 2 hours for 570k nuggets). list is also now built once
+        nuggets = document_base.nuggets
         attribute_embeddings = [attribute[LabelEmbeddingSignal] for attribute in document_base.attributes]
-        nugget_embeddings = [nugget[TextEmbeddingSignal] for nugget in document_base.nuggets]
+        nugget_embeddings = [nugget[TextEmbeddingSignal] for nugget in nuggets]
         all_embeddings = attribute_embeddings + nugget_embeddings
 
         if len(all_embeddings) < 3:
@@ -63,7 +67,7 @@ class PCAReducer(DimensionReducer):
                 document_base.attributes[idx][PCADimensionReducedLabelEmbeddingSignal] = (
                     PCADimensionReducedLabelEmbeddingSignal(embedding))
             else:
-                document_base.nuggets[idx - len(attribute_embeddings)][PCADimensionReducedTextEmbeddingSignal] = (
+                nuggets[idx - len(attribute_embeddings)][PCADimensionReducedTextEmbeddingSignal] = (
                     PCADimensionReducedTextEmbeddingSignal(embedding))
 
     def reduce_dimensions(self, data) -> ndarray:
@@ -90,8 +94,9 @@ class TSNEReducer(DimensionReducer):
 
     def _call(self, document_base: DocumentBase, interaction_callback: BaseInteractionCallback,
               status_callback: BaseStatusCallback, statistics: Statistics) -> None:
+        nuggets = document_base.nuggets  # THESIS CHANGE: built once instead of once per nugget, as in PCAReducer
         attribute_embeddings = [attribute[LabelEmbeddingSignal] for attribute in document_base.attributes]
-        nugget_embeddings = [nugget[TextEmbeddingSignal] for nugget in document_base.nuggets]
+        nugget_embeddings = [nugget[TextEmbeddingSignal] for nugget in nuggets]
         all_embeddings = attribute_embeddings + nugget_embeddings
 
         dimension_reduced_embeddings = self.reduce_dimensions(all_embeddings)
@@ -101,7 +106,7 @@ class TSNEReducer(DimensionReducer):
                 document_base.attributes[idx][TSNEDimensionReducedLabelEmbeddingSignal] = (
                     TSNEDimensionReducedLabelEmbeddingSignal(embedding))
             else:
-                document_base.nuggets[idx - len(attribute_embeddings)][TSNEDimensionReducedTextEmbeddingSignal] = (
+                nuggets[idx - len(attribute_embeddings)][TSNEDimensionReducedTextEmbeddingSignal] = (
                     TSNEDimensionReducedTextEmbeddingSignal(embedding))
 
     def reduce_dimensions(self, data) -> ndarray:
