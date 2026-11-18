@@ -2,7 +2,6 @@ import abc
 import logging
 import time
 from functools import partial
-from itertools import count
 from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
@@ -472,19 +471,22 @@ class BERTContextSentenceEmbedder(BaseEmbedder):
                    If the number of tokens in the context_sentence exceeds the given limit,
                    then a shorter context is selected such that the number is at or below the limit.
 
-                   Returns the encoding parameters, the char to token translation function and
-                   the selected context
-                   as (input_ids, token_type_ids, attention_mask, char_to_token, context_sentence)
+                   Returns the encoding parameters, the char to token translation function,
+                   the selected context and the position of the nugget in the selected context
+                   as (input_ids, token_type_ids, attention_mask, char_to_token, context_sentence,
+                   start_in_context, end_in_context)
                 """
 
-                def get_encoding_data(context_sentence, device):
+                def get_encoding_data(context_sentence, device, truncate=False):
                     """
                        Encodes the given context_sentence into tokens using the tokenizer
                        Returns the encoding parameters and char to token translation function
                        as (input_ids, token_type_ids, attention_mask, char_to_token)
+                       With truncate, the tokens after the limit are cut off.
                     """
                     encoding = tokenizer(
-                        context_sentence, return_tensors="pt", padding=True
+                        context_sentence, return_tensors="pt", padding=True,
+                        truncation=truncate, max_length=limit if truncate else None
                     )
 
                     if device is not None:
@@ -507,52 +509,48 @@ class BERTContextSentenceEmbedder(BaseEmbedder):
                         on the nugget text and contains no more tokens than allowed
                     """
                     statistics["num_too_many_token_indices"] += 1
-                    logger.error(f"There are too many token indices in context sentence '{context_sentence}'!")
 
-                    def get_candidate_contexts(context_sentence, start_in_context, end_in_context):
-                        """
-                            Candidate contexts start at the nugget and incrementally add one character at each end.
-                            If one end of the original context is reached, then only the other side is incremented.
-                            Once the other end is reached, all following candidates are just the context_sentence
-                            On first call, yields (None, nugget_text)
+                    logger.error(f"There are too many token indices in context sentence '{context_sentence[:100]}'!")
 
-                            yields the previous and the next candidate context
-                        """
-                        prev_candidate_context = None
-                        for candidate_start, candidate_end in zip(map(lambda i: max(0, i), count(start_in_context, -1)),
-                                                                  map(lambda i: min(i, len(context_sentence) - 1),
-                                                                      count(end_in_context, 1))):
-                            candidate_context = context_sentence[candidate_start:candidate_end]
-                            yield prev_candidate_context, candidate_context
-                            prev_candidate_context = candidate_context
 
-                    for prev, candidate_context in get_candidate_contexts(context_sentence, start_in_context,
-                                                                          end_in_context):
-                        input_ids, token_type_ids, attention_mask, char_to_token = get_encoding_data(candidate_context,
-                                                                                                     device)
-                        # The condition will be true at some point
-                        # because token_type_ids[0] is monotonically increasing with longer context sentences
-                        # and we know that the whole sentence is above the limit
-                        if len(token_type_ids[0]) > limit:
-                            if prev == None:
-                                """
-                                    context_sentence must contain the nugget, but if the nugget itself is too big,
-                                    then raise RuntimeError, because we can't shrink the context_sentence enough
-                                """
-                                error = f"Nugget '{candidate_context}' contains too many tokens ({len(token_type_ids[0])} > {limit})"
-                                logger.error(error)
-                                raise RuntimeError(error)
-                            context_sentence = prev
-                            input_ids, token_type_ids, attention_mask, char_to_token = get_encoding_data(
-                                context_sentence, device)
-                            break
+                    def get_window(num_characters):
+                        """Start and end of the nugget with num_characters more on each side, cut at the sentence."""
+                        return (max(0, start_in_context - num_characters),
+                                min(end_in_context + num_characters, len(context_sentence)))
+
+                    def get_num_tokens(num_characters):
+                        window_start, window_end = get_window(num_characters)
+                        return len(tokenizer(context_sentence[window_start:window_end])["input_ids"])
+
+                    if get_num_tokens(0) > limit:
+                        statistics["num_nugget_longer_than_token_limit"] += 1
+                        window_start, window_end = get_window(0)
+                        logger.error(f"Nugget '{context_sentence[window_start:window_end][:100]}' contains too many "
+                                     f"tokens ({get_num_tokens(0)} > {limit}), only its first tokens are embedded.")
+                    else:
+                        # fits always holds the nugget alone or more, too_long is at most the whole sentence
+                        fits, too_long = 0, max(start_in_context, len(context_sentence) - end_in_context)
+                        while too_long - fits > 1:
+                            middle = (fits + too_long) // 2
+                            if get_num_tokens(middle) > limit:
+                                too_long = middle
+                            else:
+                                fits = middle
+                        window_start, window_end = get_window(fits)
+
+                    context_sentence = context_sentence[window_start:window_end]
+                    start_in_context, end_in_context = start_in_context - window_start, end_in_context - window_start
+                    input_ids, token_type_ids, attention_mask, char_to_token = get_encoding_data(
+                        context_sentence, device, truncate=True)
                     logger.error(
-                        f"==> Using shorter context sentence '{context_sentence}' with {len(token_type_ids[0])} token indices "
-                        f"for nugget '{context_sentence[start_in_context:end_in_context]}'.")
+                        f"==> Using shorter context sentence '{context_sentence[:100]}' with {len(token_type_ids[0])} token indices "
+                        f"for nugget '{context_sentence[start_in_context:end_in_context][:100]}'.")
 
-                return input_ids, token_type_ids, attention_mask, char_to_token, context_sentence
+                return (input_ids, token_type_ids, attention_mask, char_to_token, context_sentence,
+                        start_in_context, end_in_context)
 
-            input_ids, token_type_ids, attention_mask, char_to_token, context_sentence = get_encoding_data_with_limited_tokens_for_context(
+            (input_ids, token_type_ids, attention_mask, char_to_token, context_sentence,
+             start_in_context, end_in_context) = get_encoding_data_with_limited_tokens_for_context(
                 context_sentence,
                 start_in_context,
                 end_in_context)

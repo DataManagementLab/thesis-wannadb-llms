@@ -115,8 +115,8 @@ class DuplicatedNuggetsCleaner(BasePipelineElement):
             old_to_new_index: Dict[int, int] = dict()
             old_index = 0
 
-            for nugget in document_base.nuggets:
-                possible_duplicate, idx = get_possible_duplicate(nugget, document.nuggets)
+            for nugget in document.nuggets:
+                possible_duplicate, idx = get_possible_duplicate(nugget, cleaned_nuggets)
                 if possible_duplicate is None:
                     old_to_new_index[old_index] = len(cleaned_nuggets)
                     cleaned_nuggets.append(nugget)
@@ -127,6 +127,13 @@ class DuplicatedNuggetsCleaner(BasePipelineElement):
 
             logger.info(f"Removed {len(document.nuggets) - len(cleaned_nuggets)} duplicated nuggets from document "
                         f"\"{document.name}\".")
+
+            # THESIS CHANGE: a mapping that points to a removed duplicate now points to the nugget that was kept
+            old_index_of: Dict[int, int] = {id(nugget): ix for ix, nugget in enumerate(document.nuggets)}
+            for name, mapped_nuggets in document.attribute_mappings.items():
+                document.attribute_mappings[name] = [cleaned_nuggets[old_to_new_index[old_index_of[id(mapped_nugget)]]]
+                                                     for mapped_nugget in mapped_nuggets]
+
             document.nuggets = cleaned_nuggets
 
             if CurrentMatchIndexSignal.identifier in document.signals:

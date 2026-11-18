@@ -1,6 +1,7 @@
 import abc
 import json
 import logging
+import re
 from typing import Any, Dict, List
 
 import requests
@@ -182,6 +183,97 @@ class StanzaNERExtractor(BaseExtractor):
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "StanzaNERExtractor":
+        return cls()
+
+
+@register_configurable_element
+class NumberPairExtractor(BaseExtractor):
+    """
+    Rule-based extractor that adds both numbers of a number pair as nuggets, e.g. "114" and "110" of the score
+    "114 - 110" or "30" and "7" of the record "( 30 - 7 )".
+
+    THESIS CHANGE (LLM feedback thesis, 2026-11-13), not part of the original WannaDB, see CORE_CHANGES.md.
+    Why: Stanza and spaCy tag such a pair as ONE entity. The single numbers are then no nuggets, so WannaDB can fill
+    a column like the points of the losing team only through custom matches. On the Rotowire test games the points of
+    the losing team were a nugget in 39 % of the games and are one in 100 % with this extractor.
+
+    The extractor must run after the NER extractors. A number that already is a nugget with exactly this span is
+    skipped. The new nuggets get the label CARDINAL, which is the label the NER extractors give most such pairs.
+    Chains of more than two numbers (dates like 2014-11-05), decimal numbers and numbers inside words are left alone.
+    """
+
+    identifier: str = "NumberPairExtractor"
+
+    # two whole numbers joined by a hyphen or an en dash on one line; neither number may be part of a word or of a
+    # number with a decimal point or comma, and no third number may follow after a further hyphen
+    PAIR_PATTERN = re.compile(
+        r"(?<![\w.,])(\d+)[ \t]*[\-\u2013][ \t]*(\d+)(?!\w|[.,]\d|[ \t]*[\-\u2013][ \t]*\d)")
+    # a number and a hyphen right before a pair: the pair is the end of a chain like 1 - 2 - 3
+    CHAIN_BEFORE_PATTERN = re.compile(r"\d[ \t]*[\-\u2013][ \t]*$")
+
+    required_signal_identifiers: Dict[str, List[str]] = {
+        "nuggets": [],
+        "attributes": [],
+        "documents": []
+    }
+
+    generated_signal_identifiers: Dict[str, List[str]] = {
+        "nuggets": [LabelSignal.identifier, POSTagsSignal.identifier, ExtractorNameSignal.identifier],
+        "attributes": [],
+        "documents": []
+    }
+
+    def __init__(self) -> None:
+        super(NumberPairExtractor, self).__init__()
+        logger.debug(f"Initialized '{self.identifier}'.")
+
+    def _call(
+            self,
+            document_base: DocumentBase,
+            interaction_callback: BaseInteractionCallback,
+            status_callback: BaseStatusCallback,
+            statistics: Statistics
+    ) -> None:
+        statistics["num_documents"] = len(document_base.documents)
+
+        for ix, document in enumerate(document_base.documents):
+            self._use_status_callback(status_callback, ix, len(document_base.documents))
+
+            existing_spans = {(nugget.start_char, nugget.end_char) for nugget in document.nuggets}
+
+            for pair in self.PAIR_PATTERN.finditer(document.text):
+                # search(text, pos, endpos) lets "$" match at the start of the pair
+                if self.CHAIN_BEFORE_PATTERN.search(document.text, max(0, pair.start() - 20), pair.start()):
+                    continue
+                statistics["num_pairs"] += 1
+                for group in (1, 2):
+                    span = (pair.start(group), pair.end(group))
+                    if span in existing_spans:
+                        statistics["num_numbers_already_nuggets"] += 1
+                        continue
+                    existing_spans.add(span)
+
+                    nugget: InformationNugget = InformationNugget(
+                        document=document,
+                        start_char=span[0],
+                        end_char=span[1]
+                    )
+
+                    nugget[POSTagsSignal] = POSTagsSignal(["CD"])  # Penn Treebank tag of a cardinal number
+                    nugget[LabelSignal] = LabelSignal("CARDINAL")
+                    nugget[ExtractorNameSignal] = ExtractorNameSignal(self.identifier)
+
+                    document.nuggets.append(nugget)
+
+                    statistics["num_nuggets"] += 1
+
+    def to_config(self) -> Dict[str, Any]:
+        return {
+            "identifier": self.identifier
+        }
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> "NumberPairExtractor":
         return cls()
 
 

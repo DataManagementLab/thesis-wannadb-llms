@@ -20,6 +20,25 @@ MULTI_ROWS = 10
 RULE_VARIANTS = tuple(f"rule_{rule}" for rule in PICK_RULES)
 READ_ORDERS = ("random", "typical", "diverse")
 
+CACHE_MODES = ("plain", "prefer", "mix")
+CACHE_RULE = "rotate"
+SHORTLIST = 10
+
+
+def threshold_window(rows: List[InformationNugget], threshold: float, size: int = SHORTLIST) -> List[InformationNugget]:
+
+    ix_lower = 0
+    while ix_lower < len(rows) and rows[ix_lower][CachedDistanceSignal] > threshold:
+        ix_lower += 1
+    half = size // 2
+    higher_left, higher_right = max(0, ix_lower - half), ix_lower
+    lower_left, lower_right = ix_lower, min(len(rows), ix_lower + half)
+    if lower_right - lower_left < half:
+        higher_left = max(0, higher_left - (half - (lower_right - lower_left)))
+    elif higher_right - higher_left < half:
+        lower_right = min(len(rows), lower_right + (half - (higher_right - higher_left)))
+    return rows[higher_left:lower_right]
+
 Spans = List[List[int]]
 
 
@@ -33,7 +52,18 @@ def stored_setting(variant: str) -> Optional[Tuple[str, Optional[int]]]:
         return variant[len("rule_"):], None
     if variant.startswith("reads_"):  # the rows of the read documents are all answered, their order does not cost
         return "random", int(variant[len("reads_"):])
+    if cache_setting(variant) is not None:
+        return CACHE_RULE, None
     return None
+
+
+def cache_setting(variant: str) -> Optional[Tuple[str, int]]:
+    if not variant.startswith("cache_"):
+        return None
+    parts = variant.split("_")
+    if len(parts) != 3 or parts[1] not in CACHE_MODES or not parts[2].startswith("r") or not parts[2][1:].isdigit():
+        raise ValueError(f"cache variant must be cache_<{'|'.join(CACHE_MODES)}>_r<rounds>, got {variant!r}")
+    return parts[1], int(parts[2][1:])
 
 
 def occurrences(text: str, value: str) -> Spans:
@@ -91,22 +121,40 @@ class StoredAnswerFeedback(BaseInteractionCallback):
     """Answers from a table instead of an LLM: no request is sent, the LLM's noise is gone and every pick rule gets
     the same answers. An answer follows the simulated user: the guess if it fits, else another fitting nugget of the
     document, else a custom match, or no value if the table has none. With read_documents only these documents are
-    answered, and the column ends when none of them is left."""
+    answered, and the column ends when none of them is left.
+
+    With cache_mode, one object must answer all columns of a table in order (one matcher run with all attributes),
+    because the cache of read documents carries over from column to column. A row needs a read of the whole document
+    unless the answer confirms the row's own nugget (that only needs the row in its sentence). The answers stay the
+    same table either way; the cache only decides which reads are new and, with "prefer", which row is answered."""
 
     def __init__(self, answers: Dict[str, Dict[str, Spans]], pick_rule: str = "random",
-                 read_documents: Optional[Set[str]] = None, multi_min: int = 3) -> None:
+                 read_documents: Optional[Set[str]] = None, multi_min: int = 3,
+                 cache_mode: Optional[str] = None, steered_budget: Optional[int] = None) -> None:
         if pick_rule not in PICK_RULES:
             raise ValueError(f"unknown pick rule {pick_rule!r}")
+        if cache_mode is not None and cache_mode not in CACHE_MODES:
+            raise ValueError(f"unknown cache mode {cache_mode!r}")
         self._answers = answers
         self._pick_rule = pick_rule
         self._read_documents = read_documents
         # fewest right rows for a multi-match
         self._multi_min = multi_min
+        self._cache_mode = cache_mode
+        if cache_mode == "mix" and steered_budget is None:
+            raise ValueError("cache mode mix needs steered_budget (rounds per column that may cost a check call)")
+        self._steered_budget = steered_budget
+        self._steered_rounds: Dict[str, int] = {}
+        # documents the LLM has read completely, with the answers of all columns
+        self.cache: Set[str] = set()
         self.pick_log: List[Dict[str, Any]] = []
 
     def _call(self, pipeline_element_identifier: str, data: Dict[str, Any]) -> Dict[str, Any]:
         if "do-attribute-request" in data.keys():
             return {"do-attribute": True}
+
+        if self._cache_mode == "mix":
+            return self._mix_round(data)
 
         attribute_name: str = data["attribute"].name
         rows: List[InformationNugget] = list(data["nuggets"])
@@ -129,6 +177,9 @@ class StoredAnswerFeedback(BaseInteractionCallback):
             rule = "random" if rule == "multi" else "nearest"
 
         pick = self._pick(rule, rows, data)
+        cache_entry: Dict[str, Any] = {}
+        if self._cache_mode is not None:
+            pick, cache_entry = self._use_cache(rule, rows, pick, data)
         result = self._answer(attribute_name, pick)
         self.pick_log.append({
             "attribute": attribute_name, "round": data["num-feedback"], "document": pick.document.name,
@@ -137,6 +188,71 @@ class StoredAnswerFeedback(BaseInteractionCallback):
             "cell_filled": bool(pick[CachedDistanceSignal] <= threshold),
             "answer_differs": not self._guess_stands(attribute_name, pick, threshold),
             "message": result["message"],
+            **cache_entry,
+        })
+        return result
+
+    def _needs_read(self, attribute_name: str, nugget: InformationNugget) -> bool:
+        """Whether answering this row needs the whole document: everything except confirming the row's own nugget
+        (another nugget, a custom match and "no value in this document" all need the full text)."""
+        spans = self._spans(attribute_name, nugget)
+        return not (spans and self._fits(nugget, spans))
+
+    def _use_cache(self, rule: str, rows: List[InformationNugget], pick: InformationNugget,
+                   data: Dict[str, Any]) -> Tuple[InformationNugget, Dict[str, Any]]:
+        attribute_name: str = data["attribute"].name
+        threshold: float = data["max-distance"]
+        rule_pick = pick
+        switched = False
+        if (self._cache_mode == "prefer" and self._needs_read(attribute_name, pick)
+                and document_key(pick.document.name) not in self.cache):
+            # the rows the check marks wrong whose document is already read; the pick rule chooses among them
+            cached_wrong = [n for n in rows if document_key(n.document.name) in self.cache
+                            and not self._guess_stands(attribute_name, n, threshold)]
+            if cached_wrong:
+                pick = self._pick(rule, cached_wrong, data)
+                switched = True
+        needs_read = self._needs_read(attribute_name, pick)
+        new_read = needs_read and document_key(pick.document.name) not in self.cache
+        if new_read:
+            self.cache.add(document_key(pick.document.name))
+        return pick, {"needs_read": needs_read, "new_read": new_read, "cache_hit": needs_read and not new_read,
+                      "switched": switched, "rule_pick_document": rule_pick.document.name,
+                      "cache_size": len(self.cache)}
+
+    def _mix_round(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """One round of cache mode "mix". data["nuggets"] must be the whole ranked list."""
+        if data["num-nuggets-above"] != 0 or data["num-nuggets-below"] > 0:
+            raise ValueError("cache mode mix needs the whole ranked list (--len-ranked-list >= number of documents)")
+        attribute_name: str = data["attribute"].name
+        threshold: float = data["max-distance"]
+        rows: List[InformationNugget] = list(data["nuggets"])
+        cached = [n for n in rows if document_key(n.document.name) in self.cache]
+        steered = self._steered_rounds.get(attribute_name, 0)
+        if cached:
+            # as the read limit: any row of a read document, no LLM call; global random like the read limit
+            pick, free = random.choice(cached), True
+            needs_read = new_read = False
+        else:
+            if steered >= self._steered_budget:
+                return {"message": "stop-interactive-matching"}
+            self._steered_rounds[attribute_name] = steered + 1
+            window = threshold_window(rows, threshold)
+            pick = self._pick(ROTATION[steered % len(ROTATION)], window, data)
+            free = False
+            needs_read = new_read = self._needs_read(attribute_name, pick)  # no row of a cached document is left
+            if new_read:
+                self.cache.add(document_key(pick.document.name))
+        result = self._answer(attribute_name, pick)
+        self.pick_log.append({
+            "attribute": attribute_name, "round": data["num-feedback"], "document": pick.document.name,
+            "position": next(i for i, n in enumerate(data["nuggets"]) if n is pick), "rows": len(data["nuggets"]),
+            "distance": float(pick[CachedDistanceSignal]), "threshold": float(threshold),
+            "cell_filled": bool(pick[CachedDistanceSignal] <= threshold),
+            "answer_differs": not self._guess_stands(attribute_name, pick, threshold),
+            "message": result["message"], "free": free, "steered_round": None if free else steered + 1,
+            "needs_read": needs_read, "new_read": new_read, "cache_hit": free, "switched": False,
+            "cache_size": len(self.cache),
         })
         return result
 
